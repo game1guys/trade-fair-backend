@@ -24,7 +24,13 @@ function parseRefreshExpiryMs(): number {
 
 export async function signup(
   pool: Pool,
-  input: { email: string; password: string; fullName: string; phone?: string | null }
+  input: {
+    email: string;
+    password: string;
+    fullName: string;
+    phone?: string | null;
+    accountType?: "visitor" | "exhibitor" | "organizer" | "service_provider";
+  }
 ) {
   const existing = await userRepo.findUserByEmail(pool, input.email);
   if (existing) throw new HttpError(409, "Email already registered");
@@ -37,6 +43,16 @@ export async function signup(
     phone: input.phone,
   });
   await userRepo.assignRoleByCode(pool, userId, "VISITOR");
+  const accountType = input.accountType ?? "visitor";
+  if (accountType === "exhibitor") {
+    await userRepo.assignRoleByCode(pool, userId, "EXHIBITOR");
+  } else if (accountType === "organizer") {
+    await userRepo.assignRoleByCode(pool, userId, "ORGANIZER");
+  } else if (accountType === "service_provider") {
+    await userRepo.assignRoleByCode(pool, userId, "SERVICE_PROVIDER");
+  }
+
+  const roles = await userRepo.getRoleCodesForUser(pool, userId);
 
   const tokens = await issueTokens(pool, userId, input.email.toLowerCase());
 
@@ -45,7 +61,7 @@ export async function signup(
     action: "AUTH_SIGNUP",
     entityType: "user",
     entityId: String(userId),
-    metadata: { email: input.email.toLowerCase() },
+    metadata: { email: input.email.toLowerCase(), accountType },
   });
 
   return {
@@ -54,7 +70,7 @@ export async function signup(
       id: String(userId),
       email: input.email.toLowerCase(),
       fullName: input.fullName,
-      roles: ["VISITOR"],
+      roles,
     },
   };
 }

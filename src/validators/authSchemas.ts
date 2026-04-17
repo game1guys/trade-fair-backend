@@ -1,10 +1,14 @@
 import { z } from "zod";
 
+export const signupAccountTypeSchema = z.enum(["visitor", "exhibitor", "organizer", "service_provider"]);
+
 export const signupSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8).max(128),
   fullName: z.string().min(1).max(255),
   phone: z.string().max(32).optional().nullable(),
+  /** Which dashboard this account should use; maps to RBAC roles on the server. */
+  accountType: signupAccountTypeSchema.optional().default("visitor"),
 });
 
 export const loginSchema = z.object({

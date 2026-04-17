@@ -4,9 +4,11 @@ import * as auditRepo from "../repositories/auditRepository.js";
 import * as kycRepo from "../repositories/kycRepository.js";
 import * as supportRepo from "../repositories/supportRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
+import * as notifRepo from "../repositories/notificationRepository.js";
+import * as disputeRepo from "../repositories/disputeRepository.js";
 import { HttpError } from "../utils/httpError.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
-import { kycSubmitSchema, supportCreateSchema } from "../validators/phase2Schemas.js";
+import { disputeCreateSchema, kycSubmitSchema, supportCreateSchema } from "../validators/phase2Schemas.js";
 
 export function createPhase2UserController(pool: Pool) {
   return {
@@ -67,6 +69,27 @@ export function createPhase2UserController(pool: Pool) {
     listMySupportTickets: async (req: AuthedRequest, res: Response) => {
       const items = await supportRepo.listMySupportTickets(pool, req.userId!);
       res.json({ tickets: items });
+    },
+
+    // --- Disputes (Phase 2 stub) ---
+    createDispute: async (req: AuthedRequest, res: Response) => {
+      const body = disputeCreateSchema.parse(req.body);
+      const paymentId = body.paymentId ? BigInt(body.paymentId) : null;
+      const id = await disputeRepo.createDispute(pool, { paymentId });
+      await auditRepo.insertAuditLog(pool, {
+        actorUserId: req.userId!,
+        action: "DISPUTE_CREATE",
+        entityType: "dispute",
+        entityId: String(id),
+        metadata: { paymentId: body.paymentId ?? null },
+      });
+      res.status(201).json({ id: String(id) });
+    },
+
+    // --- Notifications inbox (Phase 2) ---
+    listMyNotifications: async (req: AuthedRequest, res: Response) => {
+      const items = await notifRepo.listMyNotifications(pool, req.userId!);
+      res.json({ notifications: items });
     },
   };
 }

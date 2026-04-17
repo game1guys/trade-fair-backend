@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import type { Pool } from "mysql2/promise";
 import type { RowDataPacket } from "mysql2";
 import * as bookingRepo from "../repositories/bookingRepository.js";
+import * as marketplaceRepo from "../repositories/marketplaceRepository.js";
 import * as ticketRepo from "../repositories/ticketOrderRepository.js";
 import * as finalize from "../services/paymentFinalizeService.js";
 import { verifyWebhookSignature } from "../services/razorpayService.js";
@@ -74,6 +75,23 @@ export function createRazorpayWebhookHandler(pool: Pool) {
         });
       }
       return res.json({ ok: true, type: "ticket_order" });
+    }
+
+    const svcBooking = await marketplaceRepo.findServiceBookingByRazorpayOrderId(pool, orderId);
+    if (svcBooking && String(svcBooking.status) === "pending_payment") {
+      const bookingId = BigInt(String(svcBooking.id));
+      const ok = await marketplaceRepo.confirmServiceBookingPayment(pool, bookingId);
+      if (ok) {
+        await finalize.insertServiceBookingPaymentRecord(pool, {
+          payerUserId: BigInt(String(svcBooking.customer_user_id)),
+          amountMinor: BigInt(String(svcBooking.amount_minor)),
+          razorpayOrderId: orderId,
+          razorpayPaymentId: paymentId,
+          serviceBookingId: bookingId,
+          metadata: { source: "webhook" },
+        });
+      }
+      return res.json({ ok: true, type: "service_booking" });
     }
 
     return res.json({ ok: true, nothing: true });

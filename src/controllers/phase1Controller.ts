@@ -1,6 +1,6 @@
 import type { Response } from "express";
 import type { Pool } from "mysql2/promise";
-import type { ResultSetHeader } from "mysql2";
+import type { ResultSetHeader, RowDataPacket } from "mysql2";
 import * as announcementRepo from "../repositories/announcementRepository.js";
 import * as bookingRepo from "../repositories/bookingRepository.js";
 import * as eventMediaRepo from "../repositories/eventMediaRepository.js";
@@ -11,10 +11,13 @@ import * as paymentRepo from "../repositories/paymentRepository.js";
 import * as stallRepo from "../repositories/stallRepository.js";
 import * as stallHoldRepo from "../repositories/stallHoldRepository.js";
 import * as ticketRepo from "../repositories/ticketOrderRepository.js";
+import * as userRepo from "../repositories/userRepository.js";
+import * as moderationRepo from "../repositories/moderationRepository.js";
 import * as razorpay from "../services/razorpayService.js";
 import { ensureInvoiceForPayment } from "../services/invoiceService.js";
 import { sha256Hex, randomToken } from "../utils/crypto.js";
 import { HttpError } from "../utils/httpError.js";
+import { allowDemoVisitorTickets } from "../config/env.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
 import type { EventRow } from "../repositories/eventRepository.js";
 import {
@@ -39,6 +42,68 @@ function pid(v: string | string[] | undefined): bigint {
   const s = Array.isArray(v) ? v[0] : v;
   if (!s) throw new HttpError(400, "Missing id");
   return BigInt(s);
+}
+
+const DEMO_FAIR_TITLE = "Demo Fair (local)";
+
+async function findPublishedFreeZeroTicket(
+  pool: Pool
+): Promise<{ eventId: bigint; ticketTypeId: bigint } | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.id AS event_id, tt.id AS ticket_type_id
+     FROM events e
+     INNER JOIN ticket_types tt ON tt.event_id = e.id
+     WHERE e.status = 'published'
+       AND tt.price_minor = 0
+       AND tt.sold_count < tt.quota
+     ORDER BY e.id ASC, tt.id ASC
+     LIMIT 1`
+  );
+  if (!rows.length) return null;
+  return {
+    eventId: BigInt(rows[0].event_id as string),
+    ticketTypeId: BigInt(rows[0].ticket_type_id as string),
+  };
+}
+
+async function ensureDemoFairForQrDemo(pool: Pool): Promise<{ eventId: bigint; ticketTypeId: bigint }> {
+  const found = await findPublishedFreeZeroTicket(pool);
+  if (found) return found;
+
+  const [users] = await pool.query<RowDataPacket[]>("SELECT id FROM users ORDER BY id ASC LIMIT 1");
+  if (!users.length) throw new HttpError(500, "No users in database");
+
+  const orgId = BigInt(users[0].id as string);
+  const startsAt = new Date();
+  startsAt.setDate(startsAt.getDate() + 1);
+  const endsAt = new Date();
+  endsAt.setMonth(endsAt.getMonth() + 1);
+
+  const eventId = await eventRepo.insertEvent(pool, {
+    organizerUserId: orgId,
+    categoryId: null,
+    title: DEMO_FAIR_TITLE,
+    description: "Auto-created so you can try QR passes locally.",
+    venueName: "Demo venue",
+    address: null,
+    latitude: null,
+    longitude: null,
+    startsAt,
+    endsAt,
+    isB2b: true,
+    isB2c: true,
+    tags: null,
+    status: "published",
+  });
+
+  const ticketTypeId = await ticketRepo.insertTicketType(pool, {
+    eventId,
+    name: "General (demo)",
+    priceMinor: 0n,
+    quota: 1000,
+  });
+
+  return { eventId, ticketTypeId };
 }
 
 function serializeEvent(e: EventRow) {
@@ -196,6 +261,7 @@ export function createPhase1Controller(pool: Pool) {
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
       const ok = await eventRepo.updateEvent(pool, eventId, req.userId!, { status: "published" });
       if (!ok) throw new HttpError(404, "Event not found");
+      await moderationRepo.ensureOpenFlag(pool, { entityType: "event", entityId: String(eventId) });
       const out = await eventRepo.findEventById(pool, eventId);
       res.json({ event: serializeEvent(out!) });
     },
@@ -663,7 +729,25 @@ export function createPhase1Controller(pool: Pool) {
       const rows = await ticketRepo.listTicketsForVisitor(pool, req.userId!);
       const enriched = await Promise.all(
         rows.map(async (t) => {
-          const raw = await ticketRepo.getQrRawSecretForTicket(pool, BigInt(t.id), req.userId!);
+          let raw = await ticketRepo.getQrRawSecretForTicket(pool, BigInt(t.id), req.userId!);
+
+          // Backfill raw_secret for legacy tickets so we can display QR payload again.
+          // This intentionally rotates the QR secret for those tickets (old QR becomes invalid).
+          if (!raw) {
+            const ticketId = BigInt(t.id);
+            const newRaw = randomToken(16);
+            const newHash = sha256Hex(newRaw);
+
+            await pool.query<ResultSetHeader>(
+              `UPDATE qr_tokens q
+               INNER JOIN tickets tk ON tk.id = q.ticket_id
+               SET q.secret_hash = ?, q.raw_secret = ?
+               WHERE q.ticket_id = ? AND tk.visitor_user_id = ? AND q.raw_secret IS NULL`,
+              [newHash, newRaw, ticketId, req.userId!]
+            );
+
+            raw = await ticketRepo.getQrRawSecretForTicket(pool, ticketId, req.userId!);
+          }
           return {
             id: t.id,
             eventId: t.event_id,
@@ -675,6 +759,62 @@ export function createPhase1Controller(pool: Pool) {
         })
       );
       res.json({ tickets: enriched });
+    },
+
+    /** Dev/local: create one free ticket + QR when the visitor has none (or use any published ₹0 ticket slot). */
+    visitorCreateDemoTicket: async (req: AuthedRequest, res: Response) => {
+      if (!allowDemoVisitorTickets()) throw new HttpError(403, "Demo tickets disabled");
+
+      const existing = await ticketRepo.listTicketsForVisitor(pool, req.userId!);
+      if (existing.length > 0) throw new HttpError(400, "You already have tickets");
+
+      const { eventId, ticketTypeId } = await ensureDemoFairForQrDemo(pool);
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [upd] = await conn.query<ResultSetHeader>(
+          "UPDATE ticket_types SET sold_count = sold_count + 1 WHERE id = ? AND sold_count + 1 <= quota",
+          [ticketTypeId]
+        );
+        if (upd.affectedRows !== 1) throw new HttpError(409, "Ticket quota exceeded");
+
+        const [tor] = await conn.query<ResultSetHeader>(
+          `INSERT INTO ticket_orders (event_id, visitor_user_id, ticket_type_id, quantity, status, currency, total_minor, razorpay_order_id)
+           VALUES (?,?,?,?,?,?,?,?)`,
+          [eventId, req.userId!, ticketTypeId, 1, "paid", "INR", 0, null]
+        );
+        const orderId = BigInt(tor.insertId);
+
+        const [tr] = await conn.query<ResultSetHeader>(
+          `INSERT INTO tickets (ticket_order_id, ticket_type_id, visitor_user_id, event_id, status)
+           VALUES (?,?,?,?, 'unused')`,
+          [orderId, ticketTypeId, req.userId!, eventId]
+        );
+        const ticketId = BigInt(tr.insertId);
+        const raw = randomToken(16);
+        const hash = sha256Hex(raw);
+        await conn.query(`INSERT INTO qr_tokens (ticket_id, secret_hash, raw_secret) VALUES (?,?,?)`, [
+          ticketId,
+          hash,
+          raw,
+        ]);
+        await conn.commit();
+
+        res.status(201).json({
+          ok: true,
+          ticket: {
+            id: String(ticketId),
+            eventId: String(eventId),
+            qrPayload: `TFW1.${ticketId}.${raw}`,
+          },
+        });
+      } catch (e) {
+        await conn.rollback();
+        throw e;
+      } finally {
+        conn.release();
+      }
     },
 
     visitorListReceipts: async (req: AuthedRequest, res: Response) => {
@@ -858,12 +998,22 @@ export function createPhase1Controller(pool: Pool) {
     },
 
     exhibitorGetProfile: async (req: AuthedRequest, res: Response) => {
+      // Allow any logged-in user to complete exhibitor onboarding without a pre-assigned role.
+      // Once they start using exhibitor screens, we grant the EXHIBITOR role.
+      const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
+      if (!roles.includes("EXHIBITOR")) {
+        await userRepo.assignRoleByCode(pool, req.userId!, "EXHIBITOR");
+      }
       const profile = await exhibitorProfileRepo.getExhibitorProfile(pool, req.userId!);
       res.json({ profile: profile ?? null });
     },
 
     exhibitorPatchProfile: async (req: AuthedRequest, res: Response) => {
       const body = exhibitorProfileSchema.parse(req.body);
+      const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
+      if (!roles.includes("EXHIBITOR")) {
+        await userRepo.assignRoleByCode(pool, req.userId!, "EXHIBITOR");
+      }
       await exhibitorProfileRepo.upsertExhibitorProfile(pool, req.userId!, body);
       const profile = await exhibitorProfileRepo.getExhibitorProfile(pool, req.userId!);
       res.json({ profile });

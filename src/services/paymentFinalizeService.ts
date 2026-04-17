@@ -70,6 +70,7 @@ export async function insertBookingPaymentRecord(
     razorpayPaymentId: input.razorpayPaymentId,
     bookingId: input.bookingId,
     ticketOrderId: null,
+    serviceBookingId: null,
   });
   await ensureInvoiceForPayment(pool, paymentId);
 }
@@ -167,6 +168,33 @@ export async function insertTicketOrderPaymentRecord(
     razorpayPaymentId: input.razorpayPaymentId,
     bookingId: null,
     ticketOrderId: input.ticketOrderId,
+    serviceBookingId: null,
+  });
+  await ensureInvoiceForPayment(pool, paymentId);
+}
+
+export async function insertServiceBookingPaymentRecord(
+  pool: Pool,
+  input: {
+    payerUserId: bigint;
+    amountMinor: bigint;
+    razorpayOrderId: string;
+    razorpayPaymentId: string;
+    serviceBookingId: bigint;
+    metadata?: Record<string, unknown> | null;
+  }
+): Promise<void> {
+  const paymentId = await paymentRepo.insertPayment(pool, {
+    payerUserId: input.payerUserId,
+    amountMinor: input.amountMinor,
+    currency: "INR",
+    status: "captured",
+    razorpayOrderId: input.razorpayOrderId,
+    razorpayPaymentId: input.razorpayPaymentId,
+    bookingId: null,
+    ticketOrderId: null,
+    serviceBookingId: input.serviceBookingId,
+    metadata: input.metadata ?? null,
   });
   await ensureInvoiceForPayment(pool, paymentId);
 }

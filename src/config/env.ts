@@ -10,8 +10,12 @@ const monorepoRoot = path.resolve(backendRoot, "..");
 function loadEnvFile(file: string, override: boolean) {
   if (fs.existsSync(file)) dotenv.config({ path: file, override });
 }
-loadEnvFile(path.join(monorepoRoot, ".env"), false);
-loadEnvFile(path.join(backendRoot, ".env"), true);
+// In tests, Vitest sets env vars dynamically; don't let dotenv override them at import-time.
+const isTestRun = process.env.NODE_ENV === "test" || process.env.VITEST === "true";
+if (!isTestRun) {
+  loadEnvFile(path.join(monorepoRoot, ".env"), false);
+  loadEnvFile(path.join(backendRoot, ".env"), true);
+}
 
 function trim(s: string | undefined): string {
   return (s ?? "").trim();
@@ -21,6 +25,8 @@ export const env = {
   nodeEnv: process.env.NODE_ENV ?? "development",
   port: Number(process.env.PORT ?? 4000),
   apiPrefix: process.env.API_PREFIX ?? "/api/v1",
+  /** When true, `POST /visitor/tickets/demo` creates a free demo ticket + QR (also allowed when nodeEnv !== production). */
+  demoVisitorTickets: process.env.DEMO_VISITOR_TICKETS === "true",
   mysql: {
     host: trim(process.env.MYSQL_HOST) || "127.0.0.1",
     port: Number(process.env.MYSQL_PORT ?? 3306),
@@ -42,3 +48,7 @@ export const env = {
     webhookSecret: trim(process.env.RAZORPAY_WEBHOOK_SECRET),
   },
 };
+
+export function allowDemoVisitorTickets(): boolean {
+  return env.demoVisitorTickets || env.nodeEnv !== "production";
+}

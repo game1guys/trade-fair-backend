@@ -55,3 +55,33 @@ export const settingsPutSchema = z.object({
   value: z.unknown(),
 });
 
+export const adminNotificationTemplateUpsertSchema = z.object({
+  id: z.string().regex(/^\d+$/).optional().nullable(),
+  code: z.string().min(2).max(64),
+  title: z.string().min(2).max(255),
+  body: z.string().min(2).max(5000),
+  audience: z.enum(["all", "organizers", "exhibitors", "visitors"]),
+});
+
+export const adminNotificationSendSchema = z.object({
+  templateId: z.string().regex(/^\d+$/).optional().nullable(),
+  audience: z.enum(["all", "organizers", "exhibitors", "visitors"]),
+  payload: z.record(z.unknown()).optional().nullable(),
+});
+
+export const adminNotificationsListSchema = z.object({
+  limit: z.string().regex(/^\d+$/).optional(),
+});
+
+export const disputeCreateSchema = z.object({
+  paymentId: z.string().regex(/^\d+$/).optional().nullable(),
+});
+
+export const adminDisputesListSchema = z.object({
+  status: z.enum(["open", "resolved", "closed"]).optional(),
+});
+
+export const adminDisputePatchSchema = z.object({
+  status: z.enum(["resolved", "closed"]),
+});
+

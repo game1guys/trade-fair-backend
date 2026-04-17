@@ -2,7 +2,7 @@ import type { NextFunction, Response } from "express";
 import type { Pool } from "mysql2/promise";
 import { getPermissionCodesForUser } from "../repositories/permissionRepository.js";
 import { listScopesForSubAdmin } from "../repositories/subAdminScopeRepository.js";
-import { getRoleCodesForUser } from "../repositories/userRepository.js";
+import { assignRoleByCode, getRoleCodesForUser } from "../repositories/userRepository.js";
 import type { AuthedRequest } from "./authMiddleware.js";
 
 /** User must have at least one of the given role codes (e.g. ORGANIZER). */
@@ -13,7 +13,25 @@ export function requireAnyRole(pool: Pool, ...allowedRoles: string[]) {
     }
     const roles = await getRoleCodesForUser(pool, req.userId);
     if (!allowedRoles.some((r) => roles.includes(r))) {
-      return res.status(403).json({ error: "Forbidden" });
+      return res.status(403).json({
+        error: "Forbidden",
+        message: `This action requires role: ${allowedRoles.join(" or ")}. Your roles: ${roles.length ? roles.join(", ") : "none"}. Ask an admin to assign the role or use an account that already has it.`,
+      });
+    }
+    return next();
+  };
+}
+
+/**
+ * Ensures the user has a role by auto-assigning it if missing.
+ * Use for onboarding flows where role assignment should not block the UI.
+ */
+export function ensureRole(pool: Pool, roleCode: string) {
+  return async (req: AuthedRequest, res: Response, next: NextFunction) => {
+    if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
+    const roles = await getRoleCodesForUser(pool, req.userId);
+    if (!roles.includes(roleCode)) {
+      await assignRoleByCode(pool, req.userId, roleCode);
     }
     return next();
   };

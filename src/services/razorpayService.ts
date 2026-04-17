@@ -49,6 +49,26 @@ export function verifyPaymentSignature(orderId: string, paymentId: string, signa
 }
 
 /** Razorpay sends a lowercase hex SHA-256 HMAC of the raw JSON body. */
+/** Initiate a partial or full refund on Razorpay (amountMinor in paise). */
+export async function createRefund(razorpayPaymentId: string, amountMinor: number) {
+  assertConfigured();
+  const auth = Buffer.from(`${env.razorpay.keyId}:${env.razorpay.keySecret}`).toString("base64");
+  const res = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(razorpayPaymentId)}/refund`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${auth}`,
+    },
+    body: JSON.stringify({ amount: amountMinor }),
+  });
+  const data = (await res.json()) as { id?: string; error?: { description?: string } };
+  if (!res.ok) {
+    throw new HttpError(502, data.error?.description ?? "Razorpay refund failed");
+  }
+  if (!data.id) throw new HttpError(502, "Razorpay refund missing id");
+  return { refundId: data.id };
+}
+
 export function verifyWebhookSignature(rawBody: string, signatureHeader: string | undefined): boolean {
   const sig = typeof signatureHeader === "string" ? signatureHeader.trim() : "";
   if (!env.razorpay.webhookSecret || !sig) return false;
