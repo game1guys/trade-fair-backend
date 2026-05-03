@@ -29,6 +29,11 @@ export const rolePermissionsPutSchema = z.object({
   permissionCodes: z.array(z.string().min(1).max(64)).max(500),
 });
 
+/** roleId (digits) → full permission code list for that role (replaces role_permissions). */
+export const rbacMatrixPutSchema = z.object({
+  roles: z.record(z.string().regex(/^\d+$/), z.array(z.string().min(1).max(64)).max(500)),
+});
+
 export const adminRefundCreateSchema = z.object({
   amountMinor: z.number().int().positive().optional(),
   notes: z.string().max(2000).optional().nullable(),

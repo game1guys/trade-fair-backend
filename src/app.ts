@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
@@ -7,6 +8,7 @@ import type { Pool } from "mysql2/promise";
 import { env } from "./config/env.js";
 import { errorHandler } from "./middlewares/errorHandler.js";
 import { registerRoutes } from "./routes/index.js";
+import { uploadsRoot } from "./paths.js";
 
 export function createApp(pool: Pool) {
   const logger = pino({
@@ -49,8 +51,11 @@ export function createApp(pool: Pool) {
     });
   });
 
+  fs.mkdirSync(uploadsRoot, { recursive: true });
+  app.use(`${env.apiPrefix}/static/uploads`, express.static(uploadsRoot));
+
   const router = express.Router();
-  registerRoutes(router, pool);
+  registerRoutes(router, pool, uploadsRoot);
   app.use(env.apiPrefix, router);
 
   app.use(errorHandler(logger));

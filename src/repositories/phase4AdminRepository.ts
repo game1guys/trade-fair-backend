@@ -1,4 +1,4 @@
-import type { Pool, RowDataPacket } from "mysql2/promise";
+import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 
 export async function adminAnalyticsSummary(pool: Pool) {
   const [[payments]] = await pool.query<RowDataPacket[]>(
@@ -28,8 +28,16 @@ export async function adminAnalyticsSummary(pool: Pool) {
   const [[stallBookings]] = await pool.query<RowDataPacket[]>(
     `SELECT
         COALESCE(SUM(CASE WHEN status = 'confirmed' THEN 1 ELSE 0 END), 0) AS stalls_confirmed,
-        COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS stalls_pending
+        COALESCE(SUM(CASE WHEN status IN ('pending','pending_approval') THEN 1 ELSE 0 END), 0) AS stalls_pending
      FROM bookings`
+  );
+
+  const [[activeLogins]] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(DISTINCT actor_user_id) AS active_users_30d
+     FROM audit_logs
+     WHERE action = 'AUTH_LOGIN'
+       AND actor_user_id IS NOT NULL
+       AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)`
   );
 
   const [[ticketOrders]] = await pool.query<RowDataPacket[]>(
@@ -60,6 +68,7 @@ export async function adminAnalyticsSummary(pool: Pool) {
       refundsProcessed: Number(refunds.refunds_count ?? 0),
       totalUsers: Number(users.total_users ?? 0),
       newUsers30d: Number(users.new_users_30d ?? 0),
+      activeUsers30dLogins: Number(activeLogins.active_users_30d ?? 0),
       stallBookings: {
         confirmed: Number(stallBookings.stalls_confirmed ?? 0),
         pending: Number(stallBookings.stalls_pending ?? 0),
@@ -197,6 +206,11 @@ export async function adminListFeatured(pool: Pool) {
   }));
 }
 
+export async function adminDeleteFeaturedById(pool: Pool, id: bigint): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>("DELETE FROM featured_listings WHERE id = ?", [id]);
+  return r.affectedRows > 0;
+}
+
 export function ledgerCsv(rows: Awaited<ReturnType<typeof adminTransactionLedger>>) {
   const header = [
     "id",
@@ -231,5 +245,60 @@ export function ledgerCsv(rows: Awaited<ReturnType<typeof adminTransactionLedger
       .join(",")
   );
   return [header, ...lines].join("\n");
+}
+
+export async function adminListDraftEventsForCatalog(pool: Pool) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.id, e.title, e.status, e.organizer_user_id, u.email AS organizer_email, e.created_at
+     FROM events e
+     INNER JOIN users u ON u.id = e.organizer_user_id
+     WHERE e.status = 'draft'
+     ORDER BY e.id DESC
+     LIMIT 200`
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    title: String(r.title),
+    status: String(r.status),
+    organizerUserId: String(r.organizer_user_id),
+    organizerEmail: String(r.organizer_email),
+    createdAt: r.created_at,
+  }));
+}
+
+export async function adminListDraftServicesForCatalog(pool: Pool) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT s.id, s.title, s.status, s.provider_user_id, u.email AS provider_email, s.created_at
+     FROM services s
+     INNER JOIN users u ON u.id = s.provider_user_id
+     WHERE s.status = 'draft'
+     ORDER BY s.id DESC
+     LIMIT 200`
+  );
+  return rows.map((r) => ({
+    id: String(r.id),
+    title: String(r.title),
+    status: String(r.status),
+    providerUserId: String(r.provider_user_id),
+    providerEmail: String(r.provider_email),
+    createdAt: r.created_at,
+  }));
+}
+
+export async function adminPublishDraftEvent(pool: Pool, eventId: bigint): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>(
+    `UPDATE events SET status = 'published', published_at = COALESCE(published_at, NOW())
+     WHERE id = ? AND status = 'draft'`,
+    [eventId]
+  );
+  return r.affectedRows > 0;
+}
+
+export async function adminPublishDraftService(pool: Pool, serviceId: bigint): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>(
+    "UPDATE services SET status = 'published' WHERE id = ? AND status = 'draft'",
+    [serviceId]
+  );
+  return r.affectedRows > 0;
 }
 

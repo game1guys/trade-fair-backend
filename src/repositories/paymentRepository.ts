@@ -36,25 +36,40 @@ export async function insertPayment(
 
 export async function findPaymentById(pool: Pool, id: bigint) {
   const [rows] = await pool.query<RowDataPacket[]>(
-    "SELECT id, payer_user_id, amount_minor, currency, status, razorpay_payment_id, service_booking_id FROM payments WHERE id = ?",
+    "SELECT id, payer_user_id, amount_minor, currency, status, razorpay_payment_id, service_booking_id, booking_id, ticket_order_id, metadata FROM payments WHERE id = ?",
     [id]
   );
   return rows.length ? rows[0] : null;
 }
 
-export async function listPaymentsByPayer(pool: Pool, payerUserId: bigint) {
+export async function listPayments(pool: Pool, opts?: { payerUserId?: bigint; status?: string }) {
+  const clauses: string[] = ["1=1"];
+  const params: unknown[] = [];
+  if (opts?.payerUserId) {
+    clauses.push("p.payer_user_id = ?");
+    params.push(opts.payerUserId);
+  }
+  if (opts?.status) {
+    clauses.push("p.status = ?");
+    params.push(opts.status);
+  }
   const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT p.id, p.amount_minor, p.currency, p.status, p.created_at,
+    `SELECT p.id, p.payer_user_id, p.amount_minor, p.currency, p.status, p.created_at,
             p.booking_id, p.ticket_order_id, p.service_booking_id, p.razorpay_order_id, p.razorpay_payment_id,
-            i.invoice_number
+            p.metadata, i.invoice_number, u.full_name AS payer_name, u.email AS payer_email
      FROM payments p
+     INNER JOIN users u ON u.id = p.payer_user_id
      LEFT JOIN invoices i ON i.payment_id = p.id
-     WHERE p.payer_user_id = ?
-     ORDER BY p.created_at DESC`,
-    [payerUserId]
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY p.created_at DESC
+     LIMIT 200`,
+    params
   );
   return rows.map((x) => ({
     id: String(x.id),
+    payerUserId: String(x.payer_user_id),
+    payerName: String(x.payer_name),
+    payerEmail: String(x.payer_email),
     amountMinor: String(x.amount_minor),
     currency: String(x.currency),
     status: String(x.status),
@@ -65,5 +80,10 @@ export async function listPaymentsByPayer(pool: Pool, payerUserId: bigint) {
     razorpayOrderId: x.razorpay_order_id != null ? String(x.razorpay_order_id) : null,
     razorpayPaymentId: x.razorpay_payment_id != null ? String(x.razorpay_payment_id) : null,
     invoiceNumber: x.invoice_number != null ? String(x.invoice_number) : null,
+    metadata: typeof x.metadata === "string" ? JSON.parse(x.metadata) : x.metadata,
   }));
+}
+
+export async function listPaymentsByPayer(pool: Pool, payerUserId: bigint) {
+  return listPayments(pool, { payerUserId });
 }

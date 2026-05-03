@@ -55,3 +55,44 @@ export async function insertAnnouncement(
   );
   return BigInt(r.insertId);
 }
+
+export async function updateAnnouncement(
+  pool: Pool,
+  eventId: bigint,
+  announcementId: bigint,
+  patch: { title?: string; body?: string; audience?: Audience }
+): Promise<boolean> {
+  const parts: string[] = [];
+  const vals: unknown[] = [];
+  if (patch.title !== undefined) {
+    parts.push("title = ?");
+    vals.push(patch.title);
+  }
+  if (patch.body !== undefined) {
+    parts.push("body = ?");
+    vals.push(patch.body);
+  }
+  if (patch.audience !== undefined) {
+    parts.push("audience = ?");
+    vals.push(patch.audience);
+  }
+  if (!parts.length) return true;
+  vals.push(announcementId, eventId);
+  const [r] = await pool.query<ResultSetHeader>(
+    `UPDATE event_announcements SET ${parts.join(", ")} WHERE id = ? AND event_id = ?`,
+    vals
+  );
+  return r.affectedRows > 0;
+}
+
+export async function deleteAnnouncement(
+  pool: Pool,
+  eventId: bigint,
+  announcementId: bigint
+): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>(
+    "DELETE FROM event_announcements WHERE id = ? AND event_id = ?",
+    [announcementId, eventId]
+  );
+  return r.affectedRows > 0;
+}

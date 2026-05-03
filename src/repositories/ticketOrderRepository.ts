@@ -55,6 +55,65 @@ export async function findTicketType(
   };
 }
 
+export async function updateTicketType(
+  pool: Pool,
+  eventId: bigint,
+  typeId: bigint,
+  patch: { name?: string; price_minor?: bigint; quota?: number }
+): Promise<"ok" | "not_found" | "quota"> {
+  const row = await findTicketType(pool, typeId, eventId);
+  if (!row) return "not_found";
+  if (patch.quota !== undefined && patch.quota < row.sold_count) return "quota";
+
+  const parts: string[] = [];
+  const vals: unknown[] = [];
+  if (patch.name !== undefined) {
+    parts.push("name = ?");
+    vals.push(patch.name);
+  }
+  if (patch.price_minor !== undefined) {
+    parts.push("price_minor = ?");
+    vals.push(patch.price_minor);
+  }
+  if (patch.quota !== undefined) {
+    parts.push("quota = ?");
+    vals.push(patch.quota);
+  }
+  if (!parts.length) return "ok";
+
+  vals.push(typeId, eventId);
+  await pool.query<ResultSetHeader>(
+    `UPDATE ticket_types SET ${parts.join(", ")} WHERE id = ? AND event_id = ?`,
+    vals
+  );
+  return "ok";
+}
+
+/** Deletes a ticket type only when no visitor ticket rows exist for it. */
+export async function deleteTicketType(
+  pool: Pool,
+  eventId: bigint,
+  typeId: bigint
+): Promise<"deleted" | "not_found" | "has_tickets"> {
+  const [exist] = await pool.query<RowDataPacket[]>(
+    "SELECT id FROM ticket_types WHERE id = ? AND event_id = ? LIMIT 1",
+    [typeId, eventId]
+  );
+  if (!exist.length) return "not_found";
+
+  const [cntRows] = await pool.query<RowDataPacket[]>(
+    "SELECT COUNT(*) AS c FROM tickets WHERE ticket_type_id = ?",
+    [typeId]
+  );
+  if (Number(cntRows[0]?.c ?? 0) > 0) return "has_tickets";
+
+  const [r] = await pool.query<ResultSetHeader>(
+    "DELETE FROM ticket_types WHERE id = ? AND event_id = ?",
+    [typeId, eventId]
+  );
+  return r.affectedRows > 0 ? "deleted" : "not_found";
+}
+
 export async function incrementTicketSold(pool: Pool, ticketTypeId: bigint, delta: number): Promise<boolean> {
   const [r] = await pool.query<ResultSetHeader>(
     "UPDATE ticket_types SET sold_count = sold_count + ? WHERE id = ? AND sold_count + ? <= quota",
@@ -259,7 +318,7 @@ export async function markTicketUsed(pool: Pool, ticketId: bigint): Promise<bool
 export async function insertEntryScan(
   pool: Pool,
   input: {
-    ticketId: bigint;
+    ticketId: bigint | null;
     eventId: bigint;
     scannedByUserId: bigint;
     result: "valid" | "invalid" | "already_used" | "wrong_event";
@@ -273,9 +332,12 @@ export async function insertEntryScan(
 
 export async function listTicketsForVisitor(pool: Pool, visitorUserId: bigint) {
   const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT t.id, t.event_id, t.status, t.created_at, e.title AS event_title
+    `SELECT t.id, t.event_id, t.status, t.created_at, e.title AS event_title,
+            e.starts_at AS event_starts_at, e.venue_name AS venue_name,
+            tt.name AS ticket_type_name
      FROM tickets t
      INNER JOIN events e ON e.id = t.event_id
+     INNER JOIN ticket_types tt ON tt.id = t.ticket_type_id
      WHERE t.visitor_user_id = ?
      ORDER BY t.created_at DESC`,
     [visitorUserId]
@@ -286,5 +348,8 @@ export async function listTicketsForVisitor(pool: Pool, visitorUserId: bigint) {
     status: x.status,
     created_at: x.created_at,
     event_title: x.event_title,
+    event_starts_at: x.event_starts_at,
+    venue_name: x.venue_name != null ? String(x.venue_name) : null,
+    ticket_type_name: x.ticket_type_name != null ? String(x.ticket_type_name) : null,
   }));
 }

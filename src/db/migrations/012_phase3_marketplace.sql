@@ -120,7 +120,7 @@ CREATE TABLE IF NOT EXISTS commission_rules (
   scope_type ENUM('global', 'event', 'service_category') NOT NULL,
   event_id BIGINT UNSIGNED NULL,
   service_category_id INT UNSIGNED NULL,
-  commission_bps INT UNSIGNED NOT NULL DEFAULT 500,
+  commission_bps INT UNSIGNED NOT NULL DEFAULT 1000,
   active TINYINT(1) NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_cr_event (event_id),
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS commission_rules (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO commission_rules (scope_type, event_id, service_category_id, commission_bps, active)
-SELECT 'global', NULL, NULL, 500, 1
+SELECT 'global', NULL, NULL, 1000, 1
 FROM DUAL
 WHERE NOT EXISTS (SELECT 1 FROM commission_rules WHERE scope_type = 'global' LIMIT 1);
 

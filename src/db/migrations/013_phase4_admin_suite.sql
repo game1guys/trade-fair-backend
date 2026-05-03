@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS featured_listings (
 
 -- Settings defaults (JSON values)
 INSERT IGNORE INTO system_settings (`key`, value_json, updated_by_user_id) VALUES
-  ('fees.platform', JSON_OBJECT('enabled', true, 'commissionBpsDefault', 500), NULL),
+  ('fees.platform', JSON_OBJECT('enabled', true, 'commissionBpsDefault', 1000), NULL),
   ('fees.gst', JSON_OBJECT('enabled', true, 'percent', 18), NULL),
   ('branding', JSON_OBJECT('appName', 'Trade Fair Wala'), NULL),
   ('contact', JSON_OBJECT('supportEmail', '', 'supportPhone', ''), NULL);

@@ -16,6 +16,7 @@ import {
   adminSubscribeUserSchema,
   commissionRuleSchema,
   providerBookingCreateSchema,
+  providerServiceBookingPatchSchema,
   providerProfileSchema,
   refundRequestSchema,
   revenueModelSchema,
@@ -72,9 +73,16 @@ async function effectiveCommissionBps(
 
 export function createPhase3Controller(pool: Pool) {
   return {
-    listServiceCategories: async (_req: AuthedRequest, res: Response) => {
+    listServiceCategories: async (req: AuthedRequest, res: Response) => {
       const categories = await marketplaceRepo.listServiceCategories(pool);
-      res.json({ categories });
+      const [counts] = await pool.query<RowDataPacket[]>(
+        `SELECT category_id, COUNT(*) AS total FROM services WHERE status = 'published' GROUP BY category_id`
+      );
+      const mapped = categories.map((c) => ({
+        ...c,
+        serviceCount: counts.find((x) => x.category_id === c.id)?.total ?? 0,
+      }));
+      res.json({ categories: mapped });
     },
 
     listPublishedServices: async (req: AuthedRequest, res: Response) => {
@@ -236,7 +244,12 @@ export function createPhase3Controller(pool: Pool) {
     },
 
     providerListRequests: async (req: AuthedRequest, res: Response) => {
-      const rows = await marketplaceRepo.listRequestsForProvider(pool, req.userId!);
+      const st = typeof req.query.status === "string" ? req.query.status : undefined;
+      const statusFilter =
+        st === "open" || st === "in_progress" || st === "closed" ? st : undefined;
+      const rows = await marketplaceRepo.listRequestsForProvider(pool, req.userId!, {
+        status: statusFilter,
+      });
       res.json({
         requests: rows.map((r) => ({
           id: String(r.id),
@@ -309,18 +322,54 @@ export function createPhase3Controller(pool: Pool) {
 
     providerPatchBooking: async (req: AuthedRequest, res: Response) => {
       const bookingId = pid(req.params.bookingId);
-      const status = String(req.body?.status ?? "");
-      if (!["confirmed", "rejected", "completed", "cancelled"].includes(status)) {
-        throw new HttpError(400, "Invalid status");
-      }
-      const ok = await marketplaceRepo.updateServiceBookingStatus(
-        pool,
-        bookingId,
-        req.userId!,
-        status as "confirmed" | "rejected" | "completed" | "cancelled"
-      );
+      const body = providerServiceBookingPatchSchema.parse(req.body);
+      const scheduledAt =
+        body.scheduledAt === undefined
+          ? undefined
+          : body.scheduledAt === null || body.scheduledAt === ""
+            ? null
+            : new Date(body.scheduledAt);
+      const ok = await marketplaceRepo.patchServiceBookingAsProvider(pool, bookingId, req.userId!, {
+        status: body.status,
+        scheduledAt,
+      });
       if (!ok) throw new HttpError(404, "Booking not found");
       res.json({ ok: true });
+    },
+
+    providerListPayments: async (req: AuthedRequest, res: Response) => {
+      const rows = await marketplaceRepo.listPaymentsForProvider(pool, req.userId!);
+      res.json({
+        payments: rows.map((x) => ({
+          id: String(x.id),
+          amountMinor: String(x.amount_minor),
+          currency: String(x.currency),
+          status: String(x.status),
+          createdAt: x.created_at,
+          serviceBookingId: String(x.service_booking_id),
+          serviceId: String(x.service_id),
+          serviceTitle: String(x.service_title),
+          razorpayOrderId: x.razorpay_order_id != null ? String(x.razorpay_order_id) : null,
+          razorpayPaymentId: x.razorpay_payment_id != null ? String(x.razorpay_payment_id) : null,
+          invoiceNumber: x.invoice_number != null ? String(x.invoice_number) : null,
+        })),
+      });
+    },
+
+    providerListReviews: async (req: AuthedRequest, res: Response) => {
+      const rows = await marketplaceRepo.listReviewsForProvider(pool, req.userId!);
+      res.json({
+        reviews: rows.map((x) => ({
+          id: String(x.id),
+          serviceId: String(x.service_id),
+          bookingId: String(x.booking_id),
+          serviceTitle: String(x.service_title),
+          rating: Number(x.rating),
+          comment: x.comment != null ? String(x.comment) : null,
+          createdAt: x.created_at,
+          reviewerName: String(x.reviewer_name),
+        })),
+      });
     },
 
     customerCreateRequest: async (req: AuthedRequest, res: Response) => {
@@ -491,6 +540,14 @@ export function createPhase3Controller(pool: Pool) {
       res.json({ id: String(id) });
     },
 
+    adminDeleteCommissionRule: async (req: AuthedRequest, res: Response) => {
+      const id = Number(String(req.params.ruleId ?? ""));
+      if (!Number.isFinite(id) || id <= 0) throw new HttpError(400, "Invalid rule id");
+      const ok = await marketplaceRepo.deleteCommissionRuleById(pool, id);
+      if (!ok) throw new HttpError(404, "Rule not found");
+      res.json({ ok: true });
+    },
+
     adminListSubscriptionPlans: async (_req: AuthedRequest, res: Response) => {
       const rows = await marketplaceRepo.listSubscriptionPlans(pool);
       res.json({
@@ -517,6 +574,15 @@ export function createPhase3Controller(pool: Pool) {
         active: body.active,
       });
       res.json({ id });
+    },
+
+    adminDeleteSubscriptionPlan: async (req: AuthedRequest, res: Response) => {
+      const id = Number(String(req.params.planId ?? ""));
+      if (!Number.isFinite(id) || id <= 0) throw new HttpError(400, "Invalid plan id");
+      const r = await marketplaceRepo.deleteSubscriptionPlanById(pool, id);
+      if (r === "in_use") throw new HttpError(409, "Plan is referenced by subscriptions; set active=false instead");
+      if (r === "not_found") throw new HttpError(404, "Plan not found");
+      res.json({ ok: true });
     },
 
     adminSubscribeUser: async (req: AuthedRequest, res: Response) => {
@@ -552,7 +618,6 @@ export function createPhase3Controller(pool: Pool) {
       const pay = await paymentRepo.findPaymentById(pool, paymentId);
       if (!pay) throw new HttpError(404, "Payment not found");
       if (String(pay.payer_user_id) !== String(req.userId!)) throw new HttpError(403, "Forbidden");
-      if (!pay.service_booking_id) throw new HttpError(400, "Refund only supported for service payments in Phase 3");
       if (String(pay.status) !== "captured") throw new HttpError(400, "Payment not refundable");
       const maxAmt = BigInt(String(pay.amount_minor));
       const reqAmt = body.amountMinor != null ? BigInt(body.amountMinor) : maxAmt;
@@ -578,6 +643,8 @@ export function createPhase3Controller(pool: Pool) {
           razorpayPaymentId: r.razorpay_payment_id != null ? String(r.razorpay_payment_id) : null,
           payerUserId: String(r.payer_user_id),
           serviceBookingId: r.service_booking_id != null ? String(r.service_booking_id) : null,
+          bookingId: r.booking_id != null ? String(r.booking_id) : null,
+          ticketOrderId: r.ticket_order_id != null ? String(r.ticket_order_id) : null,
         })),
       });
     },

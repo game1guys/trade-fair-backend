@@ -47,6 +47,11 @@ export async function listTemplates(pool: Pool) {
   }));
 }
 
+export async function deleteTemplateById(pool: Pool, templateId: bigint): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>("DELETE FROM notification_templates WHERE id = ?", [templateId]);
+  return r.affectedRows > 0;
+}
+
 export async function createInAppNotificationsForAudience(
   pool: Pool,
   input: {

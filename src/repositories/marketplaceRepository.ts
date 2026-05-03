@@ -235,16 +235,26 @@ export async function insertServiceRequest(
   return BigInt(r.insertId);
 }
 
-export async function listRequestsForProvider(pool: Pool, providerUserId: bigint) {
+export async function listRequestsForProvider(
+  pool: Pool,
+  providerUserId: bigint,
+  opts?: { status?: "open" | "in_progress" | "closed" }
+) {
+  const clauses = ["s.provider_user_id = ?"];
+  const params: unknown[] = [providerUserId];
+  if (opts?.status) {
+    clauses.push("r.status = ?");
+    params.push(opts.status);
+  }
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT r.id, r.service_id, r.from_user_id, r.message, r.status, r.provider_response, r.created_at, r.updated_at,
             s.title AS service_title, u.email AS from_email, u.full_name AS from_name
      FROM service_requests r
      INNER JOIN services s ON s.id = r.service_id
      INNER JOIN users u ON u.id = r.from_user_id
-     WHERE s.provider_user_id = ?
+     WHERE ${clauses.join(" AND ")}
      ORDER BY r.id DESC`,
-    [providerUserId]
+    params
   );
   return rows;
 }
@@ -383,6 +393,65 @@ export async function updateServiceBookingStatus(
   return r.affectedRows === 1;
 }
 
+export async function patchServiceBookingAsProvider(
+  pool: Pool,
+  bookingId: bigint,
+  providerUserId: bigint,
+  patch: {
+    status?: "confirmed" | "rejected" | "completed" | "cancelled";
+    scheduledAt?: Date | null;
+  }
+): Promise<boolean> {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (patch.status !== undefined) {
+    sets.push("status = ?");
+    vals.push(patch.status);
+  }
+  if (patch.scheduledAt !== undefined) {
+    sets.push("scheduled_at = ?");
+    vals.push(patch.scheduledAt);
+  }
+  if (!sets.length) return false;
+  vals.push(bookingId, providerUserId);
+  const [r] = await pool.query<ResultSetHeader>(
+    `UPDATE service_bookings SET ${sets.join(", ")} WHERE id = ? AND provider_user_id = ?`,
+    vals
+  );
+  return r.affectedRows === 1;
+}
+
+/** Payments captured for this provider's service bookings (customer is payer). */
+export async function listPaymentsForProvider(pool: Pool, providerUserId: bigint) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT p.id, p.amount_minor, p.currency, p.status, p.created_at, p.razorpay_order_id, p.razorpay_payment_id,
+            p.service_booking_id, i.invoice_number, sb.service_id, s.title AS service_title
+     FROM payments p
+     INNER JOIN service_bookings sb ON sb.id = p.service_booking_id
+     INNER JOIN services s ON s.id = sb.service_id
+     WHERE sb.provider_user_id = ? AND p.service_booking_id IS NOT NULL
+     ORDER BY p.created_at DESC
+     LIMIT 200`,
+    [providerUserId]
+  );
+  return rows;
+}
+
+export async function listReviewsForProvider(pool: Pool, providerUserId: bigint) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id, r.service_id, r.booking_id, r.rating, r.comment, r.created_at,
+            u.full_name AS reviewer_name, s.title AS service_title
+     FROM service_reviews r
+     INNER JOIN services s ON s.id = r.service_id
+     INNER JOIN users u ON u.id = r.reviewer_user_id
+     WHERE s.provider_user_id = ?
+     ORDER BY r.id DESC
+     LIMIT 200`,
+    [providerUserId]
+  );
+  return rows;
+}
+
 export async function listBookingsForProvider(pool: Pool, providerUserId: bigint) {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT b.*, s.title AS service_title, u.email AS customer_email, u.full_name AS customer_name
@@ -454,7 +523,7 @@ export async function resolveCommissionBps(
     `SELECT commission_bps FROM commission_rules
      WHERE active = 1 AND scope_type = 'global' LIMIT 1`
   );
-  return g.length ? Number(g[0].commission_bps) : 500;
+  return g.length ? Number(g[0].commission_bps) : 1000;
 }
 
 export async function listCommissionRules(pool: Pool) {
@@ -586,7 +655,7 @@ export async function insertRefundRecord(
 export async function listRefundsPending(pool: Pool) {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT r.id, r.payment_id, r.amount_minor, r.status, r.created_at, r.notes,
-            p.razorpay_payment_id, p.payer_user_id, p.service_booking_id
+            p.razorpay_payment_id, p.payer_user_id, p.service_booking_id, p.booking_id, p.ticket_order_id
      FROM refunds r
      INNER JOIN payments p ON p.id = r.payment_id
      WHERE r.status = 'requested'
@@ -624,4 +693,24 @@ export async function markRefundRejected(pool: Pool, refundId: bigint, approvedB
     [approvedByUserId, refundId]
   );
   return r.affectedRows === 1;
+}
+
+export async function deleteCommissionRuleById(pool: Pool, id: number): Promise<boolean> {
+  const [r] = await pool.query<ResultSetHeader>("DELETE FROM commission_rules WHERE id = ?", [id]);
+  return r.affectedRows > 0;
+}
+
+export async function subscriptionPlanInUse(pool: Pool, planId: number): Promise<boolean> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    "SELECT 1 FROM subscriptions WHERE plan_id = ? LIMIT 1",
+    [planId]
+  );
+  return rows.length > 0;
+}
+
+export async function deleteSubscriptionPlanById(pool: Pool, planId: number): Promise<"ok" | "in_use" | "not_found"> {
+  const inUse = await subscriptionPlanInUse(pool, planId);
+  if (inUse) return "in_use";
+  const [r] = await pool.query<ResultSetHeader>("DELETE FROM subscription_plans WHERE id = ?", [planId]);
+  return r.affectedRows > 0 ? "ok" : "not_found";
 }

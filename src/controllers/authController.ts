@@ -9,6 +9,7 @@ import {
   phoneOtpVerifySchema,
   refreshSchema,
   signupSchema,
+  updateMeSchema,
 } from "../validators/authSchemas.js";
 
 export function createAuthController(pool: Pool) {
@@ -22,6 +23,22 @@ export function createAuthController(pool: Pool) {
     login: async (req: AuthedRequest, res: Response) => {
       const body = loginSchema.parse(req.body);
       const result = await authService.login(pool, body);
+      return res.json(result);
+    },
+
+    otpRequest: async (req: AuthedRequest, res: Response) => {
+      const body = phoneOtpRequestSchema.parse(req.body);
+      // Stub mode: just return success and hint the OTP
+      return res.json({
+        ok: true,
+        message: "OTP sent (stub: use 123456)",
+        stubOtp: "123456",
+      });
+    },
+
+    otpLogin: async (req: AuthedRequest, res: Response) => {
+      const body = phoneOtpVerifySchema.parse(req.body);
+      const result = await authService.otpLogin(pool, body);
       return res.json(result);
     },
 
@@ -43,8 +60,19 @@ export function createAuthController(pool: Pool) {
       return res.json(me);
     },
 
-    /** Stub OTP — Phase 1 MVP (no SMS provider). */
+    patchMe: async (req: AuthedRequest, res: Response) => {
+      if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
+      const body = updateMeSchema.parse(req.body);
+      const me = await authService.updateMe(pool, req.userId, {
+        fullName: body.fullName,
+        phone: body.phone,
+      });
+      return res.json(me);
+    },
+
+    /** Stub OTP — replace with SMS provider in production. Requires sign-in. */
     phoneRequestOtp: async (req: AuthedRequest, res: Response) => {
+      if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
       phoneOtpRequestSchema.parse(req.body);
       return res.json({
         ok: true,
@@ -54,11 +82,10 @@ export function createAuthController(pool: Pool) {
     },
 
     phoneVerifyOtp: async (req: AuthedRequest, res: Response) => {
+      if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
       const body = phoneOtpVerifySchema.parse(req.body);
-      if (body.otp !== "123456") {
-        return res.status(400).json({ error: "Invalid OTP (stub: use 123456)" });
-      }
-      return res.json({ ok: true, verified: true, phone: body.phone });
+      const user = await authService.verifyPhoneWithOtp(pool, req.userId, body);
+      return res.json({ ok: true, verified: true, phone: body.phone, user });
     },
   };
 }

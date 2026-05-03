@@ -41,6 +41,21 @@ export const providerBookingCreateSchema = z.object({
   currency: z.string().length(3).optional().default("INR"),
 });
 
+export const providerServiceBookingPatchSchema = z
+  .object({
+    status: z.enum(["confirmed", "rejected", "completed", "cancelled"]).optional(),
+    /** ISO string or datetime-local; null clears schedule */
+    scheduledAt: z.union([z.string(), z.null()]).optional(),
+  })
+  .refine((b) => b.status !== undefined || b.scheduledAt !== undefined, {
+    message: "Provide status and/or scheduledAt",
+  })
+  .superRefine((b, ctx) => {
+    if (b.scheduledAt != null && b.scheduledAt !== "" && Number.isNaN(Date.parse(b.scheduledAt))) {
+      ctx.addIssue({ code: "custom", message: "Invalid scheduledAt", path: ["scheduledAt"] });
+    }
+  });
+
 export const serviceReviewCreateSchema = z.object({
   rating: z.number().int().min(1).max(5),
   comment: z.string().max(4000).optional().nullable(),

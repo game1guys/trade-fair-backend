@@ -4,6 +4,7 @@ export const adminUsersListSchema = z.object({
   search: z.string().optional(),
   role: z.string().optional(),
   status: z.enum(["active", "inactive", "blocked"]).optional(),
+  pendingReview: z.enum(["true", "1"]).optional(),
 });
 
 export const adminUserStatusSchema = z.object({
@@ -11,6 +12,23 @@ export const adminUserStatusSchema = z.object({
 });
 
 export const adminAssignRoleSchema = z.object({
+  roleCode: z.string().min(2).max(32),
+});
+
+export const adminCreateUserSchema = z.object({
+  email: z.string().email().max(255),
+  password: z.string().min(8).max(128),
+  fullName: z.string().min(1).max(255),
+  phone: z.string().max(32).nullable().optional(),
+  roleCodes: z.array(z.string().min(2).max(32)).min(1).max(16),
+});
+
+export const adminPatchUserSchema = z.object({
+  fullName: z.string().min(1).max(255).optional(),
+  phone: z.string().max(32).nullable().optional(),
+});
+
+export const adminRemoveRoleSchema = z.object({
   roleCode: z.string().min(2).max(32),
 });
 
@@ -40,9 +58,23 @@ export const subAdminScopesPutSchema = z.object({
 });
 
 export const supportCreateSchema = z.object({
+  category: z.enum(["technical", "billing", "stall_booking", "ticket_booking", "general", "dispute"]).optional().default("general"),
   subject: z.string().min(3).max(255),
   body: z.string().min(3).max(5000),
   priority: z.enum(["low", "normal", "high"]).optional().default("normal"),
+  disputeId: z.string().regex(/^\d+$/).optional().nullable(),
+});
+
+export const supportResponseCreateSchema = z.object({
+  body: z.string().min(1).max(5000),
+});
+
+export const supportAttachmentCreateSchema = z.object({
+  responseId: z.string().regex(/^\d+$/).optional().nullable(),
+  fileUrl: z.string().min(1).max(1024),
+  fileName: z.string().min(1).max(255),
+  fileSize: z.number().int().positive(),
+  mimeType: z.string().min(1).max(128),
 });
 
 export const adminSupportPatchSchema = z.object({

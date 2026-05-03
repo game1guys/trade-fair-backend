@@ -5,7 +5,9 @@ import * as announcementRepo from "../repositories/announcementRepository.js";
 import * as bookingRepo from "../repositories/bookingRepository.js";
 import * as eventMediaRepo from "../repositories/eventMediaRepository.js";
 import * as eventRepo from "../repositories/eventRepository.js";
+import * as eventCatRepo from "../repositories/eventCategoryRepository.js";
 import * as exhibitorProfileRepo from "../repositories/exhibitorProfileRepository.js";
+import * as exhibitorFavoriteRepo from "../repositories/exhibitorFavoriteRepository.js";
 import * as organizerReadRepo from "../repositories/organizerReadRepository.js";
 import * as paymentRepo from "../repositories/paymentRepository.js";
 import * as stallRepo from "../repositories/stallRepository.js";
@@ -13,26 +15,39 @@ import * as stallHoldRepo from "../repositories/stallHoldRepository.js";
 import * as ticketRepo from "../repositories/ticketOrderRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as moderationRepo from "../repositories/moderationRepository.js";
+import * as eventReminderRepo from "../repositories/eventReminderRepository.js";
+import * as organizerCommRepo from "../repositories/organizerCommunicationRepository.js";
 import * as razorpay from "../services/razorpayService.js";
 import { ensureInvoiceForPayment } from "../services/invoiceService.js";
+import { insertBookingPaymentRecord, insertTicketOrderPaymentRecord } from "../services/paymentFinalizeService.js";
 import { sha256Hex, randomToken } from "../utils/crypto.js";
 import { HttpError } from "../utils/httpError.js";
-import { allowDemoVisitorTickets } from "../config/env.js";
+import { verifyAccessToken } from "../utils/jwt.js";
+import { allowDemoVisitorTickets, env } from "../config/env.js";
+import { emitGateScan, subscribeGateScan } from "../realtime/gateBus.js";
+import { sendSmtpEmail, sendWhatsAppCloud } from "../services/outboundMessaging.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
 import type { EventRow } from "../repositories/eventRepository.js";
 import {
   announcementCreateSchema,
+  announcementPatchSchema,
   createEventSchema,
   eventMediaCreateSchema,
+  eventReminderCreateSchema,
+  eventReminderPatchSchema,
   exhibitorBookingSchema,
+  organizerBookingReassignSchema,
   exhibitorProfileSchema,
+  organizerBulkCommunicationSchema,
   razorpayCreateOrderSchema,
   scanPayloadSchema,
   stallBulkCreateSchema,
   stallCreateSchema,
-  stallStatusPatchSchema,
+  stallOrganizerPatchSchema,
   stallTypeCreateSchema,
+  stallTypeUpdateSchema,
   ticketTypeCreateSchema,
+  ticketTypeUpdateSchema,
   updateEventSchema,
   verifyRazorpaySchema,
   visitorTicketOrderSchema,
@@ -85,6 +100,9 @@ async function ensureDemoFairForQrDemo(pool: Pool): Promise<{ eventId: bigint; t
     title: DEMO_FAIR_TITLE,
     description: "Auto-created so you can try QR passes locally.",
     venueName: "Demo venue",
+    venueCity: null,
+    venueCountry: null,
+    venueState: null,
     address: null,
     latitude: null,
     longitude: null,
@@ -109,7 +127,11 @@ async function ensureDemoFairForQrDemo(pool: Pool): Promise<{ eventId: bigint; t
 function serializeEvent(e: EventRow) {
   let tags: string[] | null = null;
   if (e.tags != null) {
-    tags = typeof e.tags === "string" ? (JSON.parse(e.tags) as string[]) : (e.tags as string[]);
+    try {
+      tags = typeof e.tags === "string" ? (JSON.parse(e.tags) as string[]) : (e.tags as string[]);
+    } catch {
+      tags = null;
+    }
   }
   return {
     id: String(e.id),
@@ -118,6 +140,9 @@ function serializeEvent(e: EventRow) {
     title: e.title,
     description: e.description,
     venueName: e.venue_name,
+    venueCity: e.venue_city,
+    venueCountry: e.venue_country,
+    venueState: e.venue_state ?? null,
     address: e.address,
     latitude: e.latitude != null ? Number(e.latitude) : null,
     longitude: e.longitude != null ? Number(e.longitude) : null,
@@ -130,6 +155,7 @@ function serializeEvent(e: EventRow) {
     publishedAt: e.published_at,
     createdAt: e.created_at,
     updatedAt: e.updated_at,
+    requireBookingApproval: Boolean((e as EventRow).require_booking_approval),
   };
 }
 
@@ -142,33 +168,52 @@ export function createPhase1Controller(pool: Pool) {
         typeof categoryRaw === "string" && categoryRaw.match(/^\d+$/) ? Number(categoryRaw) : undefined;
       const b2bOnly = req.query.b2b === "1" || req.query.b2b === "true";
       const b2cOnly = req.query.b2c === "1" || req.query.b2c === "true";
+      const venueCity = typeof req.query.venueCity === "string" ? req.query.venueCity : undefined;
+      const venueState = typeof req.query.venueState === "string" ? req.query.venueState : undefined;
+      const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom : undefined;
+      const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo : undefined;
       const rows = await eventRepo.listPublishedEvents(pool, {
         search,
         categoryId,
         b2bOnly: b2bOnly || undefined,
         b2cOnly: b2cOnly || undefined,
+        venueCity,
+        venueState,
+        dateFrom,
+        dateTo,
       });
       res.json({ events: rows.map(serializeEvent) });
     },
 
-    listPublicEventCategories: async (_req: AuthedRequest, res: Response) => {
-      const categories = await eventRepo.listEventCategories(pool);
-      res.json({ categories });
+    listPublicEventCategories: async (req: AuthedRequest, res: Response) => {
+      const categories = await eventCatRepo.listEventCategories(pool);
+      const [counts] = await pool.query<RowDataPacket[]>(
+        `SELECT category_id, COUNT(*) AS total FROM events WHERE status = 'published' GROUP BY category_id`
+      );
+      const mapped = categories.map((c) => ({
+        ...c,
+        eventCount: counts.find((x) => x.category_id === c.id)?.total ?? 0,
+      }));
+      res.json({ categories: mapped });
     },
 
     getPublicEvent: async (req: AuthedRequest, res: Response) => {
       const id = pid(req.params.eventId);
       const ev = await eventRepo.findEventById(pool, id);
       if (!ev || ev.status !== "published") throw new HttpError(404, "Event not found");
-      const [media, announcements, ticketTypes] = await Promise.all([
+      const [media, announcements, ticketTypes, reviews] = await Promise.all([
         eventMediaRepo.listMediaForEvent(pool, id),
         announcementRepo.listAnnouncementsForEventPublic(pool, id, "visitor"),
         ticketRepo.listTicketTypesForEvent(pool, id),
+        eventRepo.listReviewsForEvent(pool, id),
       ]);
+      const categoryIds = await eventCatRepo.listCategoryIdsForEvent(pool, id);
+      const mergedCats = categoryIds.length ? categoryIds : ev.category_id != null ? [ev.category_id] : [];
       res.json({
-        event: serializeEvent(ev),
+        event: { ...serializeEvent(ev), categoryIds: mergedCats },
         media,
         announcements,
+        reviews,
         ticketTypes: ticketTypes.map((t) => ({
           id: String(t.id),
           name: t.name,
@@ -197,26 +242,73 @@ export function createPhase1Controller(pool: Pool) {
       });
     },
 
+    submitEventReview: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const { rating, comment } = z
+        .object({
+          rating: z.number().min(1).max(5),
+          comment: z.string().max(1000).optional().nullable(),
+        })
+        .parse(req.body);
+
+      // Check if user has a ticket for this event
+      const [tickets] = await pool.query<RowDataPacket[]>(
+        "SELECT id FROM tickets WHERE event_id = ? AND visitor_user_id = ? LIMIT 1",
+        [eventId, req.userId!]
+      );
+      if (!tickets.length) throw new HttpError(403, "Only visitors with tickets can review events");
+
+      const id = await eventRepo.insertEventReview(pool, {
+        eventId,
+        reviewerUserId: req.userId!,
+        rating,
+        comment: comment ?? null,
+      });
+      res.json({ id: String(id) });
+    },
+
     organizerListEvents: async (req: AuthedRequest, res: Response) => {
-      const rows = await eventRepo.listEventsForOrganizer(pool, req.userId!);
-      res.json({ events: rows.map(serializeEvent) });
+      const rows = await eventRepo.listEventsForOrganizerWithCover(pool, req.userId!);
+      const ids = rows.map((r) => r.event.id);
+      const catMap = await eventCatRepo.listCategoryIdsForEvents(pool, ids);
+      res.json({
+        events: rows.map(({ event, coverImageUrl }) => {
+          const links = catMap.get(String(event.id));
+          const categoryIds =
+            links && links.length ? links : event.category_id != null ? [event.category_id] : [];
+          return {
+            ...serializeEvent(event),
+            coverImageUrl,
+            categoryIds,
+          };
+        }),
+      });
     },
 
     organizerGetEvent: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const ev = await eventRepo.findEventById(pool, eventId);
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
-      res.json({ event: serializeEvent(ev) });
+      const categoryIds = await eventCatRepo.listCategoryIdsForEvent(pool, eventId);
+      const merged = categoryIds.length ? categoryIds : ev.category_id != null ? [ev.category_id] : [];
+      res.json({ event: { ...serializeEvent(ev), categoryIds: merged } });
     },
 
     organizerCreateEvent: async (req: AuthedRequest, res: Response) => {
       const body = createEventSchema.parse(req.body);
+      const primaryCategory =
+        body.categoryIds && body.categoryIds.length > 0
+          ? body.categoryIds[0]!
+          : body.categoryId ?? null;
       const id = await eventRepo.insertEvent(pool, {
         organizerUserId: req.userId!,
-        categoryId: body.categoryId ?? null,
+        categoryId: primaryCategory,
         title: body.title,
         description: body.description ?? null,
         venueName: body.venueName,
+        venueCity: body.venueCity ?? null,
+        venueCountry: body.venueCountry ?? null,
+        venueState: body.venueState ?? null,
         address: body.address ?? null,
         latitude: body.latitude ?? null,
         longitude: body.longitude ?? null,
@@ -225,20 +317,32 @@ export function createPhase1Controller(pool: Pool) {
         isB2b: body.isB2b,
         isB2c: body.isB2c,
         tags: body.tags ?? null,
+        requireBookingApproval: body.requireBookingApproval,
         status: body.status,
       });
+      const linkIds = body.categoryIds?.length ? body.categoryIds : primaryCategory != null ? [primaryCategory] : [];
+      await eventCatRepo.replaceEventCategoryLinks(pool, id, linkIds);
       const ev = await eventRepo.findEventById(pool, id);
-      res.status(201).json({ event: serializeEvent(ev!) });
+      const categoryIds = await eventCatRepo.listCategoryIdsForEvent(pool, id);
+      res.status(201).json({ event: { ...serializeEvent(ev!), categoryIds } });
     },
 
     organizerUpdateEvent: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const body = updateEventSchema.parse(req.body);
+      let legacyCat = body.categoryId;
+      if (body.categoryIds !== undefined) {
+        legacyCat = body.categoryIds.length ? body.categoryIds[0]! : null;
+        await eventCatRepo.replaceEventCategoryLinks(pool, eventId, body.categoryIds);
+      }
       const ok = await eventRepo.updateEvent(pool, eventId, req.userId!, {
-        categoryId: body.categoryId,
+        categoryId: legacyCat,
         title: body.title,
         description: body.description,
         venueName: body.venueName,
+        venueCity: body.venueCity,
+        venueCountry: body.venueCountry,
+        venueState: body.venueState,
         address: body.address,
         latitude: body.latitude,
         longitude: body.longitude,
@@ -247,11 +351,14 @@ export function createPhase1Controller(pool: Pool) {
         isB2b: body.isB2b,
         isB2c: body.isB2c,
         tags: body.tags,
+        requireBookingApproval: body.requireBookingApproval,
         status: body.status,
       });
       if (!ok) throw new HttpError(404, "Event not found");
       const ev = await eventRepo.findEventById(pool, eventId);
-      res.json({ event: serializeEvent(ev!) });
+      const categoryIds = await eventCatRepo.listCategoryIdsForEvent(pool, eventId);
+      const merged = categoryIds.length ? categoryIds : ev!.category_id != null ? [ev!.category_id] : [];
+      res.json({ event: { ...serializeEvent(ev!), categoryIds: merged } });
     },
 
     /** Plan-compat: explicit publish endpoint. */
@@ -362,7 +469,16 @@ export function createPhase1Controller(pool: Pool) {
       const ev = await eventRepo.findEventById(pool, eventId);
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
       const rows = await ticketRepo.listTicketTypesForEvent(pool, eventId);
-      res.json({ ticketTypes: rows });
+      res.json({
+        ticketTypes: rows.map((t) => ({
+          id: String(t.id),
+          name: t.name,
+          priceMinor: String(t.price_minor),
+          quota: t.quota,
+          soldCount: t.sold_count,
+          currency: "INR",
+        })),
+      });
     },
 
     organizerCreateTicketType: async (req: AuthedRequest, res: Response) => {
@@ -377,6 +493,38 @@ export function createPhase1Controller(pool: Pool) {
         quota: body.quota,
       });
       res.status(201).json({ id: String(id) });
+    },
+
+    organizerUpdateTicketType: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const typeId = pid(req.params.ticketTypeId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const body = ticketTypeUpdateSchema.parse(req.body);
+      const r = await ticketRepo.updateTicketType(pool, eventId, typeId, {
+        name: body.name,
+        price_minor: body.priceMinor !== undefined ? BigInt(body.priceMinor) : undefined,
+        quota: body.quota,
+      });
+      if (r === "not_found") throw new HttpError(404, "Ticket type not found");
+      if (r === "quota") throw new HttpError(400, "Quota cannot be less than tickets already sold");
+      res.json({ ok: true });
+    },
+
+    organizerDeleteTicketType: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const typeId = pid(req.params.ticketTypeId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const r = await ticketRepo.deleteTicketType(pool, eventId, typeId);
+      if (r === "not_found") throw new HttpError(404, "Ticket type not found");
+      if (r === "has_tickets") {
+        throw new HttpError(
+          400,
+          "Cannot remove this ticket type while tickets have been issued. Reduce quota only, or archive elsewhere."
+        );
+      }
+      res.json({ ok: true });
     },
 
     exhibitorCreateBooking: async (req: AuthedRequest, res: Response) => {
@@ -454,8 +602,11 @@ export function createPhase1Controller(pool: Pool) {
           );
         }
 
+        const needApproval = Boolean((ev as EventRow).require_booking_approval);
         let razorpayOrderId: string | null = null;
-        if (subtotal > 0n) {
+        if (needApproval) {
+          await conn.query(`UPDATE bookings SET status = 'pending_approval' WHERE id = ?`, [bookingId]);
+        } else if (subtotal > 0n) {
           const order = await razorpay.createOrder(Number(subtotal), "INR", `bk_${bookingId}`);
           razorpayOrderId = order.orderId;
           await conn.query("UPDATE bookings SET razorpay_order_id = ? WHERE id = ?", [
@@ -463,15 +614,12 @@ export function createPhase1Controller(pool: Pool) {
             bookingId,
           ]);
         } else {
-          await conn.query(
-            "UPDATE bookings SET status = 'confirmed' WHERE id = ?",
-            [bookingId]
-          );
+          await conn.query("UPDATE bookings SET status = 'confirmed' WHERE id = ?", [bookingId]);
           for (const sid of stallIds) {
-            await conn.query(
-              "UPDATE stalls SET status = 'booked' WHERE id = ? AND event_id = ?",
-              [sid, eventId]
-            );
+            await conn.query("UPDATE stalls SET status = 'booked' WHERE id = ? AND event_id = ?", [
+              sid,
+              eventId,
+            ]);
             await conn.query("DELETE FROM stall_holds WHERE stall_id = ?", [sid]);
           }
         }
@@ -483,6 +631,7 @@ export function createPhase1Controller(pool: Pool) {
           currency: "INR",
           razorpayOrderId,
           razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
+          awaitsOrganizerApproval: needApproval,
         });
       } catch (e) {
         await conn.rollback();
@@ -497,6 +646,9 @@ export function createPhase1Controller(pool: Pool) {
       const body = verifyRazorpaySchema.parse(req.body);
       const booking = await bookingRepo.findBookingForExhibitor(pool, bookingId, req.userId!);
       if (!booking) throw new HttpError(404, "Booking not found");
+      if (booking.status === "pending_approval") {
+        throw new HttpError(400, "Booking awaits organizer approval before payment");
+      }
       if (booking.status !== "pending") throw new HttpError(400, "Booking not pending");
       if (booking.razorpay_order_id && booking.razorpay_order_id !== body.razorpayOrderId) {
         throw new HttpError(400, "Order id mismatch");
@@ -526,22 +678,14 @@ export function createPhase1Controller(pool: Pool) {
           );
           await conn.query("DELETE FROM stall_holds WHERE stall_id = ?", [row.stall_id]);
         }
-        const [payIns] = await conn.query<ResultSetHeader>(
-          `INSERT INTO payments (payer_user_id, amount_minor, currency, status, razorpay_order_id, razorpay_payment_id, booking_id, ticket_order_id)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [
-            req.userId!,
-            booking.subtotal_minor,
-            "INR",
-            "captured",
-            body.razorpayOrderId,
-            body.razorpayPaymentId,
-            bookingId,
-            null,
-          ]
-        );
         await conn.commit();
-        await ensureInvoiceForPayment(pool, BigInt(payIns.insertId));
+        await insertBookingPaymentRecord(pool, {
+          payerUserId: req.userId!,
+          amountMinor: booking.subtotal_minor,
+          razorpayOrderId: body.razorpayOrderId,
+          razorpayPaymentId: body.razorpayPaymentId,
+          bookingId,
+        });
         res.json({ ok: true });
       } catch (e) {
         await conn.rollback();
@@ -700,22 +844,14 @@ export function createPhase1Controller(pool: Pool) {
           "UPDATE ticket_orders SET status = 'paid' WHERE id = ? AND visitor_user_id = ?",
           [orderId, req.userId!]
         );
-        const [payIns] = await conn.query<ResultSetHeader>(
-          `INSERT INTO payments (payer_user_id, amount_minor, currency, status, razorpay_order_id, razorpay_payment_id, booking_id, ticket_order_id)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [
-            req.userId!,
-            order.total_minor,
-            "INR",
-            "captured",
-            body.razorpayOrderId,
-            body.razorpayPaymentId,
-            null,
-            orderId,
-          ]
-        );
         await conn.commit();
-        await ensureInvoiceForPayment(pool, BigInt(payIns.insertId));
+        await insertTicketOrderPaymentRecord(pool, {
+          payerUserId: req.userId!,
+          amountMinor: order.total_minor,
+          razorpayOrderId: body.razorpayOrderId,
+          razorpayPaymentId: body.razorpayPaymentId,
+          ticketOrderId: orderId,
+        });
         res.json({ ok: true, tickets: ticketsOut });
       } catch (e) {
         await conn.rollback();
@@ -752,6 +888,9 @@ export function createPhase1Controller(pool: Pool) {
             id: t.id,
             eventId: t.event_id,
             eventTitle: t.event_title,
+            ticketTypeName: t.ticket_type_name ?? null,
+            eventStartsAt: t.event_starts_at ?? null,
+            venueName: t.venue_name ?? null,
             status: t.status,
             createdAt: t.created_at,
             qrPayload: raw ? `TFW1.${t.id}.${raw}` : null,
@@ -835,7 +974,19 @@ export function createPhase1Controller(pool: Pool) {
       const hash = sha256Hex(raw);
       const row = await ticketRepo.findTicketByQrHash(pool, hash);
       if (!row) {
-        throw new HttpError(400, "Invalid token");
+        await ticketRepo.insertEntryScan(pool, {
+          ticketId: null,
+          eventId,
+          scannedByUserId: req.userId!,
+          result: "invalid",
+        });
+        emitGateScan(eventId, {
+          result: "invalid",
+          ticketId: null,
+          scannedAt: new Date().toISOString(),
+        });
+        res.json({ result: "invalid" });
+        return;
       }
       if (row.event_id !== eventId) {
         await ticketRepo.insertEntryScan(pool, {
@@ -843,6 +994,11 @@ export function createPhase1Controller(pool: Pool) {
           eventId,
           scannedByUserId: req.userId!,
           result: "wrong_event",
+        });
+        emitGateScan(eventId, {
+          result: "wrong_event",
+          ticketId: String(row.ticket_id),
+          scannedAt: new Date().toISOString(),
         });
         res.json({ result: "wrong_event" });
         return;
@@ -853,6 +1009,11 @@ export function createPhase1Controller(pool: Pool) {
           eventId,
           scannedByUserId: req.userId!,
           result: "already_used",
+        });
+        emitGateScan(eventId, {
+          result: "already_used",
+          ticketId: String(row.ticket_id),
+          scannedAt: new Date().toISOString(),
         });
         res.json({ result: "already_used" });
         return;
@@ -865,6 +1026,11 @@ export function createPhase1Controller(pool: Pool) {
           scannedByUserId: req.userId!,
           result: "already_used",
         });
+        emitGateScan(eventId, {
+          result: "already_used",
+          ticketId: String(row.ticket_id),
+          scannedAt: new Date().toISOString(),
+        });
         res.json({ result: "already_used" });
         return;
       }
@@ -874,7 +1040,53 @@ export function createPhase1Controller(pool: Pool) {
         scannedByUserId: req.userId!,
         result: "valid",
       });
+      emitGateScan(eventId, {
+        result: "valid",
+        ticketId: String(row.ticket_id),
+        scannedAt: new Date().toISOString(),
+      });
       res.json({ result: "valid", ticketId: String(row.ticket_id) });
+    },
+
+    /** Server-Sent Events: live gate scan feed for organizers (use ?access_token=… when EventSource cannot send Authorization). */
+    organizerGateLiveStream: async (req: AuthedRequest, res: Response) => {
+      let uid = req.userId;
+      const authHeader = req.headers.authorization;
+      if (!uid && authHeader?.startsWith("Bearer ")) {
+        try {
+          const payload = verifyAccessToken(authHeader.slice("Bearer ".length).trim());
+          uid = BigInt(payload.sub);
+        } catch {
+          throw new HttpError(401, "Invalid bearer token");
+        }
+      }
+      if (!uid && typeof req.query.access_token === "string") {
+        try {
+          const payload = verifyAccessToken(req.query.access_token);
+          uid = BigInt(payload.sub);
+        } catch {
+          throw new HttpError(401, "Invalid access_token query param");
+        }
+      }
+      if (!uid) throw new HttpError(401, "Unauthorized");
+      const roles = await userRepo.getRoleCodesForUser(pool, uid);
+      if (!roles.includes("ORGANIZER")) throw new HttpError(403, "Organizer role required");
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== uid) throw new HttpError(404, "Event not found");
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+      const send = (payload: Record<string, unknown>) => {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      };
+      const unsub = subscribeGateScan(eventId, send);
+      req.on("close", () => {
+        unsub();
+      });
+      send({ connected: true, eventId: String(eventId) });
     },
 
     organizerListEventBookings: async (req: AuthedRequest, res: Response) => {
@@ -910,6 +1122,269 @@ export function createPhase1Controller(pool: Pool) {
       res.json({ scans });
     },
 
+    organizerGetEventReports: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const summary = await organizerReadRepo.getEventReportsSummary(pool, eventId);
+      res.json({ summary });
+    },
+
+    organizerExportEventReportsCsv: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const csv = await organizerReadRepo.buildEventReportsCsv(pool, eventId);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="event_${String(eventId)}_stalls_tickets.csv"`);
+      res.status(200).send(csv);
+    },
+
+    organizerCancelEventBooking: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const bookingId = pid(req.params.bookingId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const r = await bookingRepo.cancelBookingAsOrganizer(pool, bookingId, eventId);
+      if (r === "not_found") throw new HttpError(404, "Booking not found");
+      res.json({ ok: true, alreadyCancelled: r === "already" });
+    },
+
+    organizerApproveEventBooking: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const bookingId = pid(req.params.bookingId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const r = await bookingRepo.approveBookingAsOrganizer(pool, bookingId, eventId, (amt, cur, rec) =>
+        razorpay.createOrder(amt, cur, rec)
+      );
+      if (!r.ok) {
+        if (r.code === "not_found") throw new HttpError(404, "Booking not found");
+        if (r.code === "bad_status") throw new HttpError(400, "Booking is not awaiting organizer approval");
+        if (r.code === "payment_setup_failed") throw new HttpError(502, r.message ?? "Could not create payment order");
+        throw new HttpError(500, "Unknown error");
+      }
+      res.json({
+        ok: true,
+        razorpayOrderId: r.razorpayOrderId,
+        razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
+      });
+    },
+
+    organizerReassignBookingStall: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const bookingId = pid(req.params.bookingId);
+      const body = organizerBookingReassignSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const code = await bookingRepo.organizerReassignBookingItemStall(
+        pool,
+        bookingId,
+        BigInt(body.bookingItemId),
+        eventId,
+        BigInt(body.newStallId)
+      );
+      if (code === "not_found") throw new HttpError(404, "Booking not found");
+      if (code === "bad_item") throw new HttpError(404, "Booking line not found");
+      if (code === "bad_status") throw new HttpError(400, "Cannot reassign for this booking status");
+      if (code === "stall_unavailable") throw new HttpError(409, "Target stall not available");
+      res.json({ ok: true, unchanged: code === "same_stall" });
+    },
+
+    organizerUpdateStallType: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const typeId = pid(req.params.stallTypeId);
+      const body = stallTypeUpdateSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const ok = await stallRepo.updateStallType(pool, eventId, typeId, {
+        code: body.code,
+        name: body.name,
+        price_minor: body.priceMinor !== undefined ? BigInt(body.priceMinor) : undefined,
+        currency: body.currency,
+        description: body.description,
+      });
+      if (!ok) throw new HttpError(404, "Stall type not found");
+      res.json({ ok: true });
+    },
+
+    organizerDeleteStallType: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const typeId = pid(req.params.stallTypeId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const r = await stallRepo.deleteStallType(pool, eventId, typeId);
+      if (r === "not_found") throw new HttpError(404, "Stall type not found");
+      if (r === "in_use") throw new HttpError(409, "Cannot delete stall type that still has stalls");
+      res.json({ ok: true });
+    },
+
+    organizerDeleteStallUnit: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const stallId = pid(req.params.stallId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const r = await stallRepo.deleteStallIfUnused(pool, eventId, stallId);
+      if (r === "not_found") throw new HttpError(404, "Stall not found");
+      if (r === "busy") throw new HttpError(409, "Stall is held, booked, or not removable");
+      res.json({ ok: true });
+    },
+
+    organizerPatchAnnouncement: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const annId = pid(req.params.announcementId);
+      const body = announcementPatchSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const ok = await announcementRepo.updateAnnouncement(pool, eventId, annId, {
+        title: body.title,
+        body: body.body,
+        audience: body.audience,
+      });
+      if (!ok) throw new HttpError(404, "Announcement not found");
+      res.json({ ok: true });
+    },
+
+    organizerDeleteAnnouncement: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const annId = pid(req.params.announcementId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const ok = await announcementRepo.deleteAnnouncement(pool, eventId, annId);
+      if (!ok) throw new HttpError(404, "Announcement not found");
+      res.status(204).send();
+    },
+
+    organizerListReminders: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const reminders = await eventReminderRepo.listRemindersForEvent(pool, eventId);
+      res.json({ reminders });
+    },
+
+    organizerCreateReminder: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const body = eventReminderCreateSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const id = await eventReminderRepo.insertReminder(pool, {
+        eventId,
+        remindAt: new Date(body.remindAt),
+        channel: body.channel ?? "email",
+        title: body.title ?? "",
+        body: body.body,
+        audience: body.audience ?? "both",
+      });
+      res.status(201).json({ id: String(id) });
+    },
+
+    organizerPatchReminder: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const reminderId = pid(req.params.reminderId);
+      const body = eventReminderPatchSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const ok = await eventReminderRepo.updateReminder(pool, eventId, reminderId, {
+        remindAt: body.remindAt ? new Date(body.remindAt) : undefined,
+        channel: body.channel,
+        title: body.title,
+        body: body.body,
+        audience: body.audience,
+        status: body.status,
+      });
+      if (!ok) throw new HttpError(404, "Reminder not found");
+      res.json({ ok: true });
+    },
+
+    organizerDeleteReminder: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const reminderId = pid(req.params.reminderId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const ok = await eventReminderRepo.deleteReminder(pool, eventId, reminderId);
+      if (!ok) throw new HttpError(404, "Reminder not found");
+      res.status(204).send();
+    },
+
+    organizerListCommunicationLogs: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const communications = await organizerCommRepo.listCommunicationLogs(pool, eventId);
+      res.json({ communications });
+    },
+
+    organizerBulkCommunicate: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const body = organizerBulkCommunicationSchema.parse(req.body);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const recipientCount = await organizerReadRepo.countAudienceRecipients(pool, eventId, body.audience);
+
+      let emails: string[] = [];
+      let phones: string[] = [];
+      if (body.audience === "exhibitors") {
+        emails = await organizerReadRepo.listExhibitorEmailsForEvent(pool, eventId);
+        phones = await organizerReadRepo.listExhibitorPhonesForEvent(pool, eventId);
+      } else if (body.audience === "visitors") {
+        emails = await organizerReadRepo.listVisitorEmailsForEvent(pool, eventId);
+        phones = await organizerReadRepo.listVisitorPhonesForEvent(pool, eventId);
+      } else {
+        emails = [
+          ...new Set([
+            ...(await organizerReadRepo.listExhibitorEmailsForEvent(pool, eventId)),
+            ...(await organizerReadRepo.listVisitorEmailsForEvent(pool, eventId)),
+          ]),
+        ];
+        phones = [
+          ...new Set([
+            ...(await organizerReadRepo.listExhibitorPhonesForEvent(pool, eventId)),
+            ...(await organizerReadRepo.listVisitorPhonesForEvent(pool, eventId)),
+          ]),
+        ];
+      }
+
+      let deliveryNote = "";
+      let delivered = false;
+      if (body.channel === "email") {
+        const r = await sendSmtpEmail({
+          to: emails,
+          subject: body.subject?.trim() || "Message from organizer",
+          text: body.body,
+        });
+        delivered = r.ok;
+        deliveryNote = r.ok ? "Email sent (SMTP)" : (r.error ?? "Email failed");
+      } else if (body.channel === "whatsapp") {
+        let okN = 0;
+        for (const ph of phones.slice(0, 200)) {
+          const w = await sendWhatsAppCloud(ph, body.body);
+          if (w.ok) okN += 1;
+        }
+        delivered = okN > 0;
+        deliveryNote = delivered ? `WhatsApp: ${okN} message(s)` : "WhatsApp not configured or all sends failed";
+      } else {
+        deliveryNote = "in_app log only (no email/WhatsApp send)";
+      }
+
+      const id = await organizerCommRepo.insertCommunicationLog(pool, {
+        eventId,
+        createdByUserId: req.userId!,
+        channel: body.channel,
+        audience: body.audience,
+        subject: body.subject ?? null,
+        body: body.body,
+        recipientCount,
+        meta: { deliveryNote, emailCount: emails.length, phoneCount: phones.length },
+      });
+      res.status(201).json({
+        id: String(id),
+        recipientCount,
+        delivered,
+        message: deliveryNote,
+      });
+    },
+
     exhibitorEventCatalog: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const ev = await eventRepo.findEventById(pool, eventId);
@@ -943,12 +1418,61 @@ export function createPhase1Controller(pool: Pool) {
       });
     },
 
-    /** Plan-compat: list exhibitor-visible events (same as public list). */
+    /** Plan-compat: list exhibitor-visible events (same as public list, plus favorite ids). */
     exhibitorListEvents: async (req: AuthedRequest, res: Response) => {
-      // Reuse public list; role check happens in routing.
       const search = typeof req.query.search === "string" ? req.query.search : undefined;
-      const rows = await eventRepo.listPublishedEvents(pool, { search });
-      res.json({ events: rows.map(serializeEvent) });
+      const categoryRaw = req.query.categoryId;
+      const categoryId =
+        typeof categoryRaw === "string" && categoryRaw.match(/^\d+$/) ? Number(categoryRaw) : undefined;
+      const b2bOnly = req.query.b2b === "1" || req.query.b2b === "true";
+      const b2cOnly = req.query.b2c === "1" || req.query.b2c === "true";
+      const venueCity = typeof req.query.venueCity === "string" ? req.query.venueCity : undefined;
+      const venueState = typeof req.query.venueState === "string" ? req.query.venueState : undefined;
+      const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom : undefined;
+      const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo : undefined;
+      const favoritesOnly = req.query.favorites === "1" || req.query.favorites === "true";
+      const rows = await eventRepo.listPublishedEvents(pool, {
+        search,
+        categoryId,
+        b2bOnly: b2bOnly || undefined,
+        b2cOnly: b2cOnly || undefined,
+        venueCity,
+        venueState,
+        dateFrom,
+        dateTo,
+        favoritesUserId: favoritesOnly ? req.userId! : undefined,
+      });
+      const favoriteIds = await exhibitorFavoriteRepo.listFavoriteEventIdsForUser(pool, req.userId!);
+      res.json({
+        events: rows.map(serializeEvent),
+        favoriteEventIds: favoriteIds.map((id) => String(id)),
+      });
+    },
+
+    exhibitorAddEventFavorite: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.status !== "published" || ev.ends_at < new Date()) {
+        throw new HttpError(404, "Event not found");
+      }
+      try {
+        await exhibitorFavoriteRepo.addFavorite(pool, req.userId!, eventId);
+      } catch (e: unknown) {
+        if (typeof e === "object" && e && "code" in e && (e as { code?: string }).code === "FAVORITES_TABLE_MISSING") {
+          throw new HttpError(
+            503,
+            "Favourites storage is not set up on this database. Run trade-fair-backend/db/017_app_self_heal_after_migrations.sql (or restart the API once) and retry."
+          );
+        }
+        throw e;
+      }
+      res.status(201).json({ ok: true });
+    },
+
+    exhibitorRemoveEventFavorite: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      await exhibitorFavoriteRepo.removeFavorite(pool, req.userId!, eventId);
+      res.json({ ok: true });
     },
 
     /** Plan-compat: list stalls for an event (exhibitor view). */
@@ -1053,6 +1577,30 @@ export function createPhase1Controller(pool: Pool) {
       res.status(201).json({ id: String(id) });
     },
 
+    organizerUploadEventMedia: async (req: AuthedRequest, res: Response) => {
+      const file = (req as AuthedRequest & { file?: { filename: string } }).file;
+      if (!file) throw new HttpError(400, "Missing file (use multipart field name \"file\")");
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const relativePath = `events/${eventId}/${file.filename}`;
+      /** Same-origin path so cards & `<img>` work when the UI is on Next (3000) and API is proxied or on another port. */
+      const prefix = env.apiPrefix.startsWith("/") ? env.apiPrefix : `/${env.apiPrefix}`;
+      const url = `${prefix}/static/uploads/${relativePath}`;
+      const [sortRows] = await pool.query<RowDataPacket[]>(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_sort FROM event_media WHERE event_id = ?",
+        [eventId]
+      );
+      const sortOrder = Number(sortRows[0]?.next_sort ?? 0);
+      const id = await eventMediaRepo.insertEventMedia(pool, {
+        eventId,
+        url,
+        mediaType: "image",
+        sortOrder,
+      });
+      res.status(201).json({ id: String(id), url });
+    },
+
     organizerDeleteEventMedia: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const mediaId = pid(req.params.mediaId);
@@ -1089,22 +1637,46 @@ export function createPhase1Controller(pool: Pool) {
     organizerPatchStall: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const stallId = pid(req.params.stallId);
-      const body = stallStatusPatchSchema.parse(req.body);
+      const body = stallOrganizerPatchSchema.parse(req.body);
       const ev = await eventRepo.findEventById(pool, eventId);
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
       const stall = await stallRepo.findStall(pool, stallId, eventId);
       if (!stall) throw new HttpError(404, "Stall not found");
-      if (stall.status === "booked" && body.status !== "booked") {
-        throw new HttpError(409, "Cannot change status of a booked stall from this endpoint");
+
+      if (body.status !== undefined) {
+        if (stall.status === "booked" && body.status !== "booked") {
+          throw new HttpError(409, "Cannot change status of a booked stall from this endpoint");
+        }
+        const ok = await stallRepo.setStallStatus(pool, stallId, eventId, body.status);
+        if (!ok) throw new HttpError(404, "Stall not found");
       }
-      const ok = await stallRepo.setStallStatus(pool, stallId, eventId, body.status);
-      if (!ok) throw new HttpError(404, "Stall not found");
+
+      if (
+        body.label !== undefined ||
+        body.gridRow !== undefined ||
+        body.gridCol !== undefined ||
+        body.stallTypeId !== undefined
+      ) {
+        if (stall.status === "booked" || stall.status === "held") {
+          throw new HttpError(409, "Cannot edit layout/type of a held or booked stall");
+        }
+        await stallRepo.updateStallLayout(pool, eventId, stallId, {
+          label: body.label,
+          gridRow: body.gridRow,
+          gridCol: body.gridCol,
+          stallTypeId: body.stallTypeId !== undefined ? BigInt(body.stallTypeId) : undefined,
+        });
+      }
+
       res.json({ ok: true });
     },
 
     exhibitorListBookings: async (req: AuthedRequest, res: Response) => {
       const bookings = await bookingRepo.listBookingsForExhibitor(pool, req.userId!);
-      res.json({ bookings });
+      res.json({
+        bookings,
+        razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
+      });
     },
   };
 }

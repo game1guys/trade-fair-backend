@@ -41,11 +41,28 @@ export const env = {
     refreshExpires: process.env.JWT_REFRESH_EXPIRES ?? "7d",
   },
   corsOrigin: trim(process.env.CORS_ORIGIN) || "http://localhost:3000",
+  /** Server-only Geocoding API key (never expose to the browser). When set, venue search prefers Google over OSM. */
+  googleMapsApiKey: trim(process.env.GOOGLE_MAPS_API_KEY),
+  /** Optional region bias for Google Geocoding (ISO 3166-1 alpha-2), e.g. `in` for India. */
+  googleMapsRegion: trim(process.env.GOOGLE_MAPS_REGION) || "in",
   razorpay: {
     keyId: trim(process.env.RAZORPAY_KEY_ID),
     keySecret: trim(process.env.RAZORPAY_KEY_SECRET),
     /** Must be the signing secret from Razorpay Dashboard → Webhooks (same app as KEY_ID), not the API key secret. */
     webhookSecret: trim(process.env.RAZORPAY_WEBHOOK_SECRET),
+  },
+  /** Optional SMTP for organizer bulk email & scheduled reminders. */
+  smtp: {
+    host: trim(process.env.SMTP_HOST),
+    port: Number(process.env.SMTP_PORT ?? 587),
+    user: trim(process.env.SMTP_USER),
+    pass: process.env.SMTP_PASS ?? "",
+    from: trim(process.env.SMTP_FROM) || "noreply@localhost",
+  },
+  /** Meta WhatsApp Cloud API (optional). */
+  whatsapp: {
+    token: trim(process.env.WHATSAPP_CLOUD_TOKEN),
+    phoneNumberId: trim(process.env.WHATSAPP_PHONE_NUMBER_ID),
   },
 };
 

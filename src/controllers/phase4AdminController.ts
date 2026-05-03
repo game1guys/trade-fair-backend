@@ -15,6 +15,7 @@ import {
   flagsQuerySchema,
   ledgerQuerySchema,
   rolePermissionsPutSchema,
+  rbacMatrixPutSchema,
 } from "../validators/phase4Schemas.js";
 
 function pid(v: string | string[] | undefined): bigint {
@@ -108,6 +109,56 @@ export function createPhase4AdminController(pool: Pool) {
       res.json({ ok: true });
     },
 
+    featuredDelete: async (req: AuthedRequest, res: Response) => {
+      const id = pid(req.params.featureId);
+      const ok = await phase4Repo.adminDeleteFeaturedById(pool, id);
+      if (!ok) throw new HttpError(404, "Featured item not found");
+      await auditRepo.insertAuditLog(pool, {
+        actorUserId: req.userId!,
+        action: "ADMIN_FEATURED_DELETE",
+        entityType: "featured_listing",
+        entityId: String(id),
+        metadata: {},
+      });
+      res.json({ ok: true });
+    },
+
+    adminCatalogDrafts: async (_req: AuthedRequest, res: Response) => {
+      const [draftEvents, draftServices] = await Promise.all([
+        phase4Repo.adminListDraftEventsForCatalog(pool),
+        phase4Repo.adminListDraftServicesForCatalog(pool),
+      ]);
+      res.json({ draftEvents, draftServices });
+    },
+
+    adminPublishCatalogEvent: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ok = await phase4Repo.adminPublishDraftEvent(pool, eventId);
+      if (!ok) throw new HttpError(404, "Draft event not found");
+      await auditRepo.insertAuditLog(pool, {
+        actorUserId: req.userId!,
+        action: "ADMIN_CATALOG_PUBLISH_EVENT",
+        entityType: "event",
+        entityId: String(eventId),
+        metadata: {},
+      });
+      res.json({ ok: true });
+    },
+
+    adminPublishCatalogService: async (req: AuthedRequest, res: Response) => {
+      const serviceId = pid(req.params.serviceId);
+      const ok = await phase4Repo.adminPublishDraftService(pool, serviceId);
+      if (!ok) throw new HttpError(404, "Draft service not found");
+      await auditRepo.insertAuditLog(pool, {
+        actorUserId: req.userId!,
+        action: "ADMIN_CATALOG_PUBLISH_SERVICE",
+        entityType: "service",
+        entityId: String(serviceId),
+        metadata: {},
+      });
+      res.json({ ok: true });
+    },
+
     // --- Plan-compat admin APIs ---
     adminListRoles: async (_req: AuthedRequest, res: Response) => {
       const roles = await rolePermRepo.listRoles(pool);
@@ -143,6 +194,25 @@ export function createPhase4AdminController(pool: Pool) {
       });
       const codes = await rolePermRepo.listRolePermissionCodes(pool, roleId);
       res.json({ ok: true, roleId, permissionCodes: codes });
+    },
+
+    adminRbacMatrixGet: async (_req: AuthedRequest, res: Response) => {
+      const data = await rolePermRepo.getRbacPermissionMatrix(pool);
+      res.json(data);
+    },
+
+    adminRbacMatrixPut: async (req: AuthedRequest, res: Response) => {
+      const body = rbacMatrixPutSchema.parse(req.body);
+      const r = await rolePermRepo.putRbacMatrixFromPayload(pool, body.roles);
+      if (r.failedRoleId != null) throw new HttpError(404, `Role not found: ${r.failedRoleId}`);
+      await auditRepo.insertAuditLog(pool, {
+        actorUserId: req.userId!,
+        action: "ADMIN_RBAC_MATRIX_PUT",
+        entityType: "rbac",
+        entityId: "matrix",
+        metadata: { roleCount: Object.keys(body.roles).length },
+      });
+      res.json({ ok: true });
     },
 
     adminCreateRefundForPayment: async (req: AuthedRequest, res: Response) => {

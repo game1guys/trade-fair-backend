@@ -24,6 +24,11 @@ export const logoutSchema = z.object({
   refreshToken: z.string().min(10).optional(),
 });
 
+export const updateMeSchema = z.object({
+  fullName: z.string().min(1).max(255).optional(),
+  phone: z.string().max(32).nullable().optional(),
+});
+
 /** Phase 1 stub — no SMS; any request returns success; verify accepts fixed code `123456`. */
 export const phoneOtpRequestSchema = z.object({
   phone: z.string().min(10).max(20),
