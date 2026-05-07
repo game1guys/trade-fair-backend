@@ -10,6 +10,7 @@ import * as supportRepo from "../repositories/supportRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as notifRepo from "../repositories/notificationRepository.js";
 import * as disputeRepo from "../repositories/disputeRepository.js";
+import { env } from "../config/env.js";
 import { HttpError } from "../utils/httpError.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
 import {

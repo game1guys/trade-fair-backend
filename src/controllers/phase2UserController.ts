@@ -124,7 +124,7 @@ export function createPhase2UserController(pool: Pool) {
     },
 
     getSupportTicketDetails: async (req: AuthedRequest, res: Response) => {
-      const ticketId = BigInt(req.params.id);
+      const ticketId = BigInt(String(req.params.id));
       // Basic check: is this the owner? (Staff can also access via admin panel)
       const [rows] = await pool.query<import("mysql2").RowDataPacket[]>(
         "SELECT created_by_user_id FROM support_tickets WHERE id = ?",
@@ -139,7 +139,7 @@ export function createPhase2UserController(pool: Pool) {
     },
 
     addSupportResponse: async (req: AuthedRequest, res: Response) => {
-      const ticketId = BigInt(req.params.id);
+      const ticketId = BigInt(String(req.params.id));
       const body = supportResponseCreateSchema.parse(req.body);
 
       // Check owner
@@ -164,7 +164,7 @@ export function createPhase2UserController(pool: Pool) {
       const file = (req as AuthedRequest & { file?: { filename: string; originalname: string; mimetype: string; size: number } }).file;
       if (!file) throw new HttpError(400, 'Missing file (multipart field name "file")');
 
-      const ticketId = BigInt(req.params.id);
+      const ticketId = BigInt(String(req.params.id));
       const responseId = req.body.responseId ? BigInt(req.body.responseId) : null;
 
       // Check owner

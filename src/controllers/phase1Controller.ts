@@ -24,6 +24,7 @@ import { sha256Hex, randomToken } from "../utils/crypto.js";
 import { HttpError } from "../utils/httpError.js";
 import { verifyAccessToken } from "../utils/jwt.js";
 import { allowDemoVisitorTickets, env } from "../config/env.js";
+import { z } from "zod";
 import { emitGateScan, subscribeGateScan } from "../realtime/gateBus.js";
 import { sendSmtpEmail, sendWhatsAppCloud } from "../services/outboundMessaging.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
@@ -185,8 +186,8 @@ export function createPhase1Controller(pool: Pool) {
       res.json({ events: rows.map(serializeEvent) });
     },
 
-    listPublicEventCategories: async (req: AuthedRequest, res: Response) => {
-      const categories = await eventCatRepo.listEventCategories(pool);
+    listPublicEventCategories: async (_req: AuthedRequest, res: Response) => {
+      const categories = await eventRepo.listEventCategories(pool);
       const [counts] = await pool.query<RowDataPacket[]>(
         `SELECT category_id, COUNT(*) AS total FROM events WHERE status = 'published' GROUP BY category_id`
       );

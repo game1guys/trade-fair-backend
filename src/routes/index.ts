@@ -51,7 +51,7 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
       destination: (req, _file, cb) => {
         const raw = req.params.eventId;
         if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
-          cb(new Error("Invalid event id"));
+          cb(new Error("Invalid event id"), "");
           return;
         }
         const dir = path.join(uploadsRoot, "events", raw);
