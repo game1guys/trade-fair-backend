@@ -21,9 +21,12 @@ export function createApp(pool: Pool) {
 
   const app = express();
   app.use(helmet());
+  /** `*` is invalid with `credentials: true`; reflect the request Origin in dev when wide-open CORS is set. */
+  const corsOrigin: string | boolean =
+    env.corsOrigin === "*" || env.corsOrigin === "" ? true : env.corsOrigin;
   app.use(
     cors({
-      origin: env.corsOrigin,
+      origin: corsOrigin,
       credentials: true,
     })
   );

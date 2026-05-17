@@ -6,6 +6,8 @@ export const createEventSchema = z.object({
   categoryIds: z.array(z.number().int().positive()).max(32).optional(),
   /** When true, exhibitor stall bookings stay pending until organizer approves (then payment opens if paid). */
   requireBookingApproval: z.boolean().optional().default(false),
+  /** When true, the same visitor ticket QR can be scanned at the gate multiple times (re-entry); ticket stays valid. */
+  entryQrAllowReentry: z.boolean().optional().default(false),
   title: z.string().min(1).max(255),
   description: z.string().nullable().optional(),
   venueName: z.string().min(1).max(255),
@@ -184,3 +186,64 @@ export const organizerBulkCommunicationSchema = z.object({
   subject: z.string().max(255).optional(),
   body: z.string().min(1),
 });
+
+export const organizerPayoutProfilePutSchema = z
+  .object({
+    accountHolderName: z.string().max(255).optional().default(""),
+    bankAccountNumber: z.string().max(32).nullable().optional(),
+    ifsc: z.string().max(20).nullable().optional(),
+    upiId: z.string().max(255).nullable().optional(),
+    razorpayLinkedAccountId: z.string().max(64).nullable().optional(),
+    /** Optional PAN for Razorpay Route stakeholder KYC (ABCDE1234F). */
+    stakeholderPan: z.string().max(10).nullable().optional(),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    const bankNum = (data.bankAccountNumber ?? "").replace(/\s/g, "");
+    const ifsc = (data.ifsc ?? "").trim().toUpperCase();
+    const upi = (data.upiId ?? "").trim();
+    const linked = (data.razorpayLinkedAccountId ?? "").trim();
+    const pan = (data.stakeholderPan ?? "").trim().toUpperCase();
+
+    if (bankNum && !/^\d{9,18}$/.test(bankNum)) {
+      ctx.addIssue({ code: "custom", message: "Bank account number must be 9–18 digits", path: ["bankAccountNumber"] });
+    }
+    if (ifsc && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) {
+      ctx.addIssue({ code: "custom", message: "IFSC must look like ABCD0123456", path: ["ifsc"] });
+    }
+    if (bankNum && !ifsc) {
+      ctx.addIssue({ code: "custom", message: "IFSC is required when bank account number is set", path: ["ifsc"] });
+    }
+    if (ifsc && !bankNum) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Bank account number is required when IFSC is set",
+        path: ["bankAccountNumber"],
+      });
+    }
+    if (upi && !/^[\w.\-+]{2,64}@[\w.-]{2,64}$/.test(upi)) {
+      ctx.addIssue({ code: "custom", message: "UPI ID looks invalid (e.g. name@paytm)", path: ["upiId"] });
+    }
+    if (linked && !/^acc_[A-Za-z0-9]+$/.test(linked)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Linked account id should look like acc_xxxxxxxx",
+        path: ["razorpayLinkedAccountId"],
+      });
+    }
+
+    if (!bankNum && !upi) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Add your UPI ID, or bank account number with IFSC.",
+        path: ["upiId"],
+      });
+    }
+    if (pan && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "PAN must look like ABCDE1234F (10 characters).",
+        path: ["stakeholderPan"],
+      });
+    }
+  });

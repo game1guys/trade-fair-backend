@@ -12,6 +12,7 @@ import { createPhase2AdminController } from "../controllers/phase2AdminControlle
 import { createPhase2UserController } from "../controllers/phase2UserController.js";
 import { createPhase3Controller } from "../controllers/phase3Controller.js";
 import { createPhase4AdminController } from "../controllers/phase4AdminController.js";
+import { createVolunteerController } from "../controllers/volunteerController.js";
 import { createRazorpayWebhookHandler } from "../controllers/razorpayWebhookController.js";
 import { requireAuth, type AuthedRequest } from "../middlewares/authMiddleware.js";
 import {
@@ -30,6 +31,7 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
   const p2u = createPhase2UserController(pool);
   const p3 = createPhase3Controller(pool);
   const p4a = createPhase4AdminController(pool);
+  const volunteer = createVolunteerController(pool);
   const rzWebhook = createRazorpayWebhookHandler(pool);
 
   const authLimiter = rateLimit({
@@ -71,6 +73,31 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     },
   });
 
+  const serviceImageUpload = multer({
+    storage: multer.diskStorage({
+      destination: (req, _file, cb) => {
+        const raw = req.params.serviceId;
+        if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
+          cb(new Error("Invalid service id"), "");
+          return;
+        }
+        const dir = path.join(uploadsRoot, "services", raw);
+        fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      },
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const safe = [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext) ? ext : ".jpg";
+        cb(null, `${randomUUID()}${safe}`);
+      },
+    }),
+    limits: { fileSize: 6 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const allowed = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+      cb(null, allowed.has(file.mimetype));
+    },
+  });
+
   const kycDocumentUpload = multer({
     storage: multer.diskStorage({
       destination: (req, _file, cb) => {
@@ -92,6 +119,31 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => {
       const allowed = new Set(["application/pdf", "image/jpeg", "image/png", "image/webp"]);
+      cb(null, allowed.has(file.mimetype));
+    },
+  });
+
+  const volunteerPhotoUpload = multer({
+    storage: multer.diskStorage({
+      destination: (req, _file, cb) => {
+        const uid = (req as AuthedRequest).userId;
+        if (uid == null) {
+          cb(new Error("Unauthorized"), "");
+          return;
+        }
+        const dir = path.join(uploadsRoot, "volunteers", String(uid));
+        fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      },
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        const safe = [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext) ? ext : ".jpg";
+        cb(null, `${randomUUID()}${safe}`);
+      },
+    }),
+    limits: { fileSize: 4 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+      const allowed = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
       cb(null, allowed.has(file.mimetype));
     },
   });
@@ -172,13 +224,55 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     p1.submitEventReview(req as AuthedRequest, res).catch(next)
   );
 
-  // Organizer
+  router.get("/subscription/plans", (req, res, next) =>
+    p3.listPublicSubscriptionPlans(req as AuthedRequest, res).catch(next)
+  );
+  router.post("/subscription/referral/validate", requireAuth, (req, res, next) =>
+    p3.subscriptionValidateReferral(req as AuthedRequest, res).catch(next)
+  );
+  router.post("/subscription/checkout", requireAuth, (req, res, next) =>
+    p3.subscriptionCheckout(req as AuthedRequest, res).catch(next)
+  );
+  router.post("/subscription/verify", requireAuth, (req, res, next) =>
+    p3.subscriptionVerify(req as AuthedRequest, res).catch(next)
+  );
+
+  router.get(
+    "/organizer/payout-profile",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p1.organizerGetPayoutProfile(req as AuthedRequest, res).catch(next)
+  );
+  router.put(
+    "/organizer/payout-profile",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p1.organizerPutPayoutProfile(req as AuthedRequest, res).catch(next)
+  );
+
+  // Organizer (payout profile is account-wide; not per-event)
   router.get(
     "/organizer/events",
     requireAuth,
     ensureRole(pool, "ORGANIZER"),
     denyPendingAdminReview(pool),
     (req, res, next) => p1.organizerListEvents(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/organizer/events/:eventId/marketplace-services",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p1.organizerListMarketplaceServicesForEvent(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/organizer/events/:eventId/marketplace-deals",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p1.organizerListEventMarketplaceDeals(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/organizer/events/:eventId",
@@ -284,6 +378,68 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     ensureRole(pool, "ORGANIZER"),
     denyPendingAdminReview(pool),
     (req, res, next) => p1.organizerScanEntry(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/organizer/volunteers",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => volunteer.organizerListVolunteers(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/organizer/volunteers",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    volunteerPhotoUpload.single("photo"),
+    (req, res, next) => volunteer.organizerCreateVolunteer(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/organizer/events/:eventId/volunteers",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => volunteer.organizerListEventVolunteers(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/organizer/events/:eventId/volunteers/assign",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => volunteer.organizerAssignVolunteer(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/organizer/events/:eventId/volunteers",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    volunteerPhotoUpload.single("photo"),
+    (req, res, next) => volunteer.organizerCreateAndAssignVolunteer(req as AuthedRequest, res).catch(next)
+  );
+  router.delete(
+    "/organizer/events/:eventId/volunteers/:volunteerId",
+    requireAuth,
+    ensureRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => volunteer.organizerUnassignVolunteer(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/volunteer/events",
+    requireAuth,
+    ensureRole(pool, "VOLUNTEER"),
+    (req, res, next) => volunteer.volunteerListEvents(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/volunteer/me",
+    requireAuth,
+    ensureRole(pool, "VOLUNTEER"),
+    (req, res, next) => volunteer.volunteerMe(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/volunteer/events/:eventId/entry/scan",
+    requireAuth,
+    ensureRole(pool, "VOLUNTEER"),
+    (req, res, next) => volunteer.volunteerScanEntry(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/organizer/events/:eventId/bookings",
@@ -499,37 +655,37 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
   router.get(
     "/exhibitor/events",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorListEvents(req as AuthedRequest, res).catch(next)
   );
   router.post(
     "/exhibitor/favorites/:eventId",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorAddEventFavorite(req as AuthedRequest, res).catch(next)
   );
   router.delete(
     "/exhibitor/favorites/:eventId",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorRemoveEventFavorite(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/exhibitor/events/:eventId/stalls",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorListEventStalls(req as AuthedRequest, res).catch(next)
   );
   router.post(
     "/exhibitor/stalls/:stallId/hold",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorHoldStall(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/exhibitor/events/:eventId/catalog",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorEventCatalog(req as AuthedRequest, res).catch(next)
   );
   router.get(
@@ -545,31 +701,31 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
   router.get(
     "/exhibitor/payments",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorListPayments(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/exhibitor/bookings",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorListBookings(req as AuthedRequest, res).catch(next)
   );
   router.post(
     "/exhibitor/bookings/:bookingId/refund-request",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorRequestBookingRefund(req as AuthedRequest, res).catch(next)
   );
   router.post(
     "/exhibitor/events/:eventId/bookings",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorCreateBooking(req as AuthedRequest, res).catch(next)
   );
   router.post(
     "/exhibitor/bookings/:bookingId/pay/verify",
     requireAuth,
-    requireAnyRole(pool, "EXHIBITOR"),
+    ensureRole(pool, "EXHIBITOR"),
     (req, res, next) => p1.exhibitorVerifyBooking(req as AuthedRequest, res).catch(next)
   );
 
@@ -625,6 +781,37 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     requireAuth,
     marketplaceCustomer,
     (req, res, next) => p3.customerListRequests(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/organizer/marketplace/accepted-contracts",
+    requireAuth,
+    requireAnyRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.organizerListAcceptedContracts(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/marketplace/service-requests/:requestId/messages",
+    requireAuth,
+    (req, res, next) => p3.listServiceRequestThread(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/marketplace/service-requests/:requestId/messages",
+    requireAuth,
+    (req, res, next) => p3.postServiceRequestMessage(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/marketplace/service-requests/:requestId/contract",
+    requireAuth,
+    requireAnyRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.organizerSendServiceContract(req as AuthedRequest, res).catch(next)
+  );
+  router.put(
+    "/marketplace/providers/:providerUserId/organizer-rating",
+    requireAuth,
+    requireAnyRole(pool, "ORGANIZER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.organizerUpsertProviderRating(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/marketplace/my-bookings",
@@ -688,6 +875,14 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     denyPendingAdminReview(pool),
     (req, res, next) => p3.providerPatchService(req as AuthedRequest, res).catch(next)
   );
+  router.post(
+    "/provider/services/:serviceId/images/upload",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    serviceImageUpload.single("file"),
+    (req, res, next) => p3.providerUploadServiceImage(req as AuthedRequest, res).catch(next)
+  );
   router.get(
     "/provider/service-requests",
     requireAuth,
@@ -702,6 +897,34 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     denyPendingAdminReview(pool),
     (req, res, next) => p3.providerPatchRequest(req as AuthedRequest, res).catch(next)
   );
+  router.get(
+    "/provider/service-requests/:requestId/messages",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.listServiceRequestThread(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/provider/service-requests/:requestId/messages",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.postServiceRequestMessage(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/provider/service-requests/:requestId/contract/accept",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.providerAcceptServiceContract(req as AuthedRequest, res).catch(next)
+  );
+  router.post(
+    "/provider/service-requests/:requestId/contract/decline",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.providerDeclineServiceContract(req as AuthedRequest, res).catch(next)
+  );
   router.post(
     "/provider/service-bookings",
     requireAuth,
@@ -715,6 +938,20 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     requireAnyRole(pool, "SERVICE_PROVIDER"),
     denyPendingAdminReview(pool),
     (req, res, next) => p3.providerListBookings(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/provider/marketplace/accepted-contracts",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.providerListAcceptedContracts(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/provider/marketplace/accepted-contracts/:contractId",
+    requireAuth,
+    requireAnyRole(pool, "SERVICE_PROVIDER"),
+    denyPendingAdminReview(pool),
+    (req, res, next) => p3.providerGetAcceptedContract(req as AuthedRequest, res).catch(next)
   );
   router.patch(
     "/provider/service-bookings/:bookingId",
@@ -832,6 +1069,12 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     (req, res, next) => p2a.adminReviewKyc(req as AuthedRequest, res).catch(next)
   );
 
+  router.get(
+    "/admin/sub-admins",
+    requireAuth,
+    requirePermission(pool, "admin.sub_admins.write"),
+    (req, res, next) => p2a.adminListSubAdmins(req as AuthedRequest, res).catch(next)
+  );
   router.post(
     "/admin/sub-admins",
     requireAuth,
@@ -961,37 +1204,7 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     (req, res, next) => p2a.adminGetTransaction(req as AuthedRequest, res).catch(next)
   );
 
-  // --- Phase 3: admin monetization & refunds ---
-  router.get(
-    "/admin/monetization/revenue-model",
-    requireAuth,
-    requirePermission(pool, "admin.monetization.read"),
-    (req, res, next) => p3.adminGetRevenueModel(req as AuthedRequest, res).catch(next)
-  );
-  router.put(
-    "/admin/monetization/revenue-model",
-    requireAuth,
-    requirePermission(pool, "admin.monetization.write"),
-    (req, res, next) => p3.adminPutRevenueModel(req as AuthedRequest, res).catch(next)
-  );
-  router.get(
-    "/admin/monetization/commission-rules",
-    requireAuth,
-    requirePermission(pool, "admin.monetization.read"),
-    (req, res, next) => p3.adminListCommissionRules(req as AuthedRequest, res).catch(next)
-  );
-  router.put(
-    "/admin/monetization/commission-rules",
-    requireAuth,
-    requirePermission(pool, "admin.monetization.write"),
-    (req, res, next) => p3.adminPutCommissionRule(req as AuthedRequest, res).catch(next)
-  );
-  router.delete(
-    "/admin/monetization/commission-rules/:ruleId",
-    requireAuth,
-    requirePermission(pool, "admin.monetization.write"),
-    (req, res, next) => p3.adminDeleteCommissionRule(req as AuthedRequest, res).catch(next)
-  );
+  // --- Phase 3: admin subscription plans & refunds ---
   router.get(
     "/admin/monetization/subscription-plans",
     requireAuth,
@@ -1015,6 +1228,24 @@ export function registerRoutes(router: Router, pool: Pool, uploadsRoot: string) 
     requireAuth,
     requirePermission(pool, "admin.monetization.write"),
     (req, res, next) => p3.adminSubscribeUser(req as AuthedRequest, res).catch(next)
+  );
+  router.get(
+    "/admin/monetization/referral-codes",
+    requireAuth,
+    requirePermission(pool, "admin.monetization.read"),
+    (req, res, next) => p3.adminListReferralCodes(req as AuthedRequest, res).catch(next)
+  );
+  router.put(
+    "/admin/monetization/referral-codes",
+    requireAuth,
+    requirePermission(pool, "admin.monetization.write"),
+    (req, res, next) => p3.adminUpsertReferralCode(req as AuthedRequest, res).catch(next)
+  );
+  router.patch(
+    "/admin/monetization/referral-codes/:id/active",
+    requireAuth,
+    requirePermission(pool, "admin.monetization.write"),
+    (req, res, next) => p3.adminSetReferralCodeActive(req as AuthedRequest, res).catch(next)
   );
   router.get(
     "/admin/refunds/pending",

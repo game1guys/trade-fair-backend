@@ -19,7 +19,7 @@ export async function sendSmtpEmail(opts: {
     });
     await transporter.sendMail({
       from: env.smtp.from,
-      bcc: opts.to.join(", "),
+      to: opts.to.join(", "),
       subject: opts.subject,
       text: opts.text,
       replyTo: opts.replyTo,

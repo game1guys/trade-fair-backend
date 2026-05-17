@@ -1,0 +1,25 @@
+-- Organizer sends service contract; provider fills manpower/machinery and accepts → deal done.
+CREATE TABLE IF NOT EXISTS service_request_contracts (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  service_request_id BIGINT UNSIGNED NOT NULL,
+  organizer_user_id BIGINT UNSIGNED NOT NULL,
+  provider_user_id BIGINT UNSIGNED NOT NULL,
+  status ENUM('pending_acceptance', 'accepted', 'declined', 'cancelled') NOT NULL DEFAULT 'pending_acceptance',
+  service_description TEXT NOT NULL,
+  duration_days INT UNSIGNED NOT NULL,
+  people_count INT UNSIGNED NOT NULL,
+  manpower_available INT UNSIGNED NULL,
+  machinery_json JSON NULL,
+  organizer_notes TEXT NULL,
+  provider_notes TEXT NULL,
+  sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  accepted_at TIMESTAMP NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_src_request (service_request_id),
+  INDEX idx_src_provider (provider_user_id),
+  INDEX idx_src_status (status),
+  CONSTRAINT fk_src_request FOREIGN KEY (service_request_id) REFERENCES service_requests (id) ON DELETE CASCADE,
+  CONSTRAINT fk_src_organizer FOREIGN KEY (organizer_user_id) REFERENCES users (id) ON DELETE CASCADE,
+  CONSTRAINT fk_src_provider FOREIGN KEY (provider_user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

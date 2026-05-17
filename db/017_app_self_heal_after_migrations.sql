@@ -40,10 +40,7 @@ CREATE TABLE IF NOT EXISTS exhibitor_event_favorites (
   CONSTRAINT fk_fav_event FOREIGN KEY (event_id) REFERENCES events (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- ---------------------------------------------------------------------------
--- bookings: refund request timestamp (009)
--- ---------------------------------------------------------------------------
-ALTER TABLE bookings ADD COLUMN refund_requested_at DATETIME NULL;
+-- bookings.refund_requested_at: already applied in migration 009 / FULL_SCHEMA_001_through_016 — do not repeat.
 
 -- ---------------------------------------------------------------------------
 -- users: phone OTP verification timestamp (H5 visitor profile)

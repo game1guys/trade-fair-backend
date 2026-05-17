@@ -2,7 +2,7 @@ import type { NextFunction, Response } from "express";
 import type { Pool } from "mysql2/promise";
 import { getPermissionCodesForUser } from "../repositories/permissionRepository.js";
 import { listScopesForSubAdmin } from "../repositories/subAdminScopeRepository.js";
-import { assignRoleByCode, getRoleCodesForUser, userNeedsAdminReview } from "../repositories/userRepository.js";
+import { assignRoleByCode, getRoleCodesForUser } from "../repositories/userRepository.js";
 import type { AuthedRequest } from "./authMiddleware.js";
 
 /** User must have at least one of the given role codes (e.g. ORGANIZER). */
@@ -37,20 +37,10 @@ export function ensureRole(pool: Pool, roleCode: string) {
   };
 }
 
-/** Blocks organizer/service-provider dashboards until admin clears `pending_admin_review`. */
-export function denyPendingAdminReview(pool: Pool) {
-  return async (req: AuthedRequest, res: Response, next: NextFunction) => {
-    if (!req.userId) return res.status(401).json({ error: "Unauthorized" });
-    const roles = await getRoleCodesForUser(pool, req.userId);
-    if (!roles.includes("ORGANIZER") && !roles.includes("SERVICE_PROVIDER")) return next();
-    const pending = await userNeedsAdminReview(pool, req.userId);
-    if (pending) {
-      return res.status(403).json({
-        error: "Forbidden",
-        message: "Your organizer or service-provider account is pending admin approval.",
-      });
-    }
-    return next();
+/** Legacy no-op: verification is only via KYC (`kyc_documents`), not `users.pending_admin_review`. */
+export function denyPendingAdminReview(_pool: Pool) {
+  return async (_req: AuthedRequest, _res: Response, next: NextFunction) => {
+    next();
   };
 }
 

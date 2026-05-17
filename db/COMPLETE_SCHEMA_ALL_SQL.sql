@@ -1,3 +1,11 @@
+-- =============================================================================
+-- Trade Fair Wala — COMPLETE backend schema (single file)
+-- Contents: 001–016 (ordered) + migration 017 + 018 + 019 + self-heal DDL + subscription plan columns
+-- Apply to a fresh MySQL 8+ database:
+--   mysql -u USER -p NEW_DATABASE < db/COMPLETE_SCHEMA_ALL_SQL.sql
+-- Re-running may error on existing objects; use a new DB or skip failed statements.
+-- =============================================================================
+
 -- Trade Fair Wala — migrations 001→016 (same order as repo)
 -- mysql -u USER -p DATABASE < trade-fair-backend/db/FULL_SCHEMA_001_through_016_ORDERED.sql
 
@@ -812,3 +820,133 @@ ALTER TABLE bookings MODIFY COLUMN status ENUM(
   'confirmed',
   'cancelled'
 ) NOT NULL DEFAULT 'pending';
+
+-- ========== 017_entry_scans_nullable_ticket.sql ==========
+-- Phase 1 follow-up: Allow logging invalid scans (no ticket_id)
+ALTER TABLE entry_scans MODIFY ticket_id BIGINT UNSIGNED NULL;
+
+-- ========== 018_support_system_v2.sql ==========
+-- H9 Support & Dispute Management Enhancements
+
+-- Support ticket categories and linkage
+ALTER TABLE support_tickets
+  ADD COLUMN category ENUM('technical', 'billing', 'stall_booking', 'ticket_booking', 'general', 'dispute') NOT NULL DEFAULT 'general' AFTER role_code,
+  ADD COLUMN dispute_id BIGINT UNSIGNED NULL AFTER assigned_to_user_id,
+  ADD CONSTRAINT fk_support_dispute FOREIGN KEY (dispute_id) REFERENCES disputes (id) ON DELETE SET NULL;
+
+-- Support ticket messages/responses
+CREATE TABLE IF NOT EXISTS support_ticket_responses (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ticket_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  body TEXT NOT NULL,
+  is_staff_response TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_response_ticket (ticket_id),
+  CONSTRAINT fk_response_ticket FOREIGN KEY (ticket_id) REFERENCES support_tickets (id) ON DELETE CASCADE,
+  CONSTRAINT fk_response_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Attachments for support tickets and responses
+CREATE TABLE IF NOT EXISTS support_attachments (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ticket_id BIGINT UNSIGNED NOT NULL,
+  response_id BIGINT UNSIGNED NULL,
+  file_url VARCHAR(512) NOT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  file_size INT UNSIGNED NOT NULL,
+  mime_type VARCHAR(128) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_attach_ticket (ticket_id),
+  CONSTRAINT fk_attach_ticket FOREIGN KEY (ticket_id) REFERENCES support_tickets (id) ON DELETE CASCADE,
+  CONSTRAINT fk_attach_response FOREIGN KEY (response_id) REFERENCES support_ticket_responses (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Permissions for support management
+INSERT IGNORE INTO permissions (code, description) VALUES
+  ('admin.support.read', 'View support tickets and responses'),
+  ('admin.support.write', 'Manage support tickets and responses');
+
+INSERT IGNORE INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM roles r INNER JOIN permissions p
+WHERE r.code = 'SUPER_ADMIN' AND p.code IN ('admin.support.read', 'admin.support.write');
+
+INSERT IGNORE INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM roles r INNER JOIN permissions p
+WHERE r.code = 'SUB_ADMIN' AND p.code IN ('admin.support.read', 'admin.support.write');
+
+-- ========== 019_event_reviews.sql ==========
+-- H10 Additional Features: Ratings & reviews for events
+
+CREATE TABLE IF NOT EXISTS event_reviews (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  event_id BIGINT UNSIGNED NOT NULL,
+  reviewer_user_id BIGINT UNSIGNED NOT NULL,
+  rating TINYINT UNSIGNED NOT NULL DEFAULT 5,
+  comment TEXT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_event_review_event (event_id),
+  CONSTRAINT fk_event_review_event FOREIGN KEY (event_id) REFERENCES events (id) ON DELETE CASCADE,
+  CONSTRAINT fk_event_review_user FOREIGN KEY (reviewer_user_id) REFERENCES users (id) ON DELETE CASCADE,
+  UNIQUE KEY uniq_event_reviewer (event_id, reviewer_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ========== db/017_app_self_heal_after_migrations.sql ==========
+-- Trade Fair Wala — extra DDL mirrored from `src/db/ensureOptionalSchema.ts`
+-- Run AFTER 001–016 if you apply SQL manually (the Node app also runs these checks on boot).
+-- If a column/table already exists, MySQL will error on that statement — skip it or run piecemeal.
+
+-- ---------------------------------------------------------------------------
+-- events: venue_state (014 already adds venue_city + venue_country)
+-- ---------------------------------------------------------------------------
+ALTER TABLE events
+  ADD COLUMN venue_state VARCHAR(128) NULL AFTER venue_country;
+
+-- ---------------------------------------------------------------------------
+-- users: pending admin review gate (organizer / service_provider dashboards)
+-- ---------------------------------------------------------------------------
+ALTER TABLE users
+  ADD COLUMN pending_admin_review TINYINT(1) NOT NULL DEFAULT 0 AFTER status;
+
+-- ---------------------------------------------------------------------------
+-- support_tickets: SLA columns (Phase 2 base table is in 010)
+-- ---------------------------------------------------------------------------
+ALTER TABLE support_tickets
+  ADD COLUMN sla_first_reply_due_at DATETIME NULL AFTER assigned_to_user_id;
+
+ALTER TABLE support_tickets
+  ADD COLUMN sla_resolution_due_at DATETIME NULL AFTER sla_first_reply_due_at;
+
+ALTER TABLE support_tickets
+  ADD COLUMN first_staff_action_at DATETIME NULL AFTER sla_resolution_due_at;
+
+-- ---------------------------------------------------------------------------
+-- exhibitor: saved fairs (favourites)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS exhibitor_event_favorites (
+  user_id BIGINT UNSIGNED NOT NULL,
+  event_id BIGINT UNSIGNED NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, event_id),
+  INDEX idx_fav_user (user_id),
+  INDEX idx_fav_event (event_id),
+  CONSTRAINT fk_fav_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+  CONSTRAINT fk_fav_event FOREIGN KEY (event_id) REFERENCES events (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- bookings.refund_requested_at: already in 001–016 block above (migration 009).
+
+-- ---------------------------------------------------------------------------
+-- users: phone OTP verification timestamp (H5 visitor profile)
+-- ---------------------------------------------------------------------------
+ALTER TABLE users ADD COLUMN phone_verified_at DATETIME NULL AFTER phone;
+
+-- ========== subscription_plans role + limits (ensureOptionalSchema parity) ==========
+-- Skip if columns already exist (e.g. after a previous run).
+
+ALTER TABLE subscription_plans
+  ADD COLUMN target_role_code VARCHAR(32) NOT NULL DEFAULT 'ORGANIZER' AFTER active;
+
+ALTER TABLE subscription_plans
+  ADD COLUMN limitations_json JSON NULL AFTER target_role_code;
+

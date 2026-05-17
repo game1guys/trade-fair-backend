@@ -36,10 +36,35 @@ export async function insertPayment(
 
 export async function findPaymentById(pool: Pool, id: bigint) {
   const [rows] = await pool.query<RowDataPacket[]>(
-    "SELECT id, payer_user_id, amount_minor, currency, status, razorpay_payment_id, service_booking_id, booking_id, ticket_order_id, metadata FROM payments WHERE id = ?",
+    `SELECT id, payer_user_id, amount_minor, currency, status,
+            razorpay_order_id, razorpay_payment_id, service_booking_id, booking_id, ticket_order_id, metadata
+     FROM payments WHERE id = ?`,
     [id]
   );
   return rows.length ? rows[0] : null;
+}
+
+export async function findPaymentByRazorpayOrderAndPayer(pool: Pool, payerUserId: bigint, razorpayOrderId: string) {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT id, payer_user_id, amount_minor, currency, status, razorpay_order_id, razorpay_payment_id, metadata
+     FROM payments WHERE payer_user_id = ? AND razorpay_order_id = ? LIMIT 1`,
+    [payerUserId, razorpayOrderId]
+  );
+  return rows.length ? rows[0] : null;
+}
+
+export async function updatePaymentCaptured(pool: Pool, paymentId: bigint, razorpayPaymentId: string): Promise<void> {
+  await pool.query(
+    `UPDATE payments SET status = 'captured', razorpay_payment_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [razorpayPaymentId, paymentId]
+  );
+}
+
+export async function updatePaymentRazorpayOrderId(pool: Pool, paymentId: bigint, razorpayOrderId: string): Promise<void> {
+  await pool.query(`UPDATE payments SET razorpay_order_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [
+    razorpayOrderId,
+    paymentId,
+  ]);
 }
 
 export async function listPayments(pool: Pool, opts?: { payerUserId?: bigint; status?: string }) {
@@ -86,4 +111,15 @@ export async function listPayments(pool: Pool, opts?: { payerUserId?: bigint; st
 
 export async function listPaymentsByPayer(pool: Pool, payerUserId: bigint) {
   return listPayments(pool, { payerUserId });
+}
+
+/** Shallow-merge JSON into `payments.metadata` (MySQL JSON_MERGE_PATCH). */
+export async function mergePaymentMetadata(pool: Pool, paymentId: bigint, patch: Record<string, unknown>): Promise<void> {
+  await pool.query(
+    `UPDATE payments
+     SET metadata = JSON_MERGE_PATCH(COALESCE(metadata, '{}'), CAST(? AS JSON)),
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [JSON.stringify(patch), paymentId]
+  );
 }

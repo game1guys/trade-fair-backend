@@ -21,6 +21,8 @@ export type EventRow = {
   tags: unknown;
   /** Present after migration 016 */
   require_booking_approval?: number;
+  /** Present after migration 021 — 1 = gate QR can be scanned multiple times without consuming ticket */
+  entry_qr_allow_reentry?: number;
   status: "draft" | "published" | "cancelled";
   published_at: Date | null;
   created_at: Date;
@@ -56,14 +58,16 @@ export async function insertEvent(
     isB2c: boolean;
     tags: string[] | null;
     requireBookingApproval?: boolean;
+    /** When true, gate scans record valid entry each time without marking ticket used */
+    entryQrAllowReentry?: boolean;
     status: "draft" | "published";
   }
 ): Promise<bigint> {
   const [result] = await pool.query<ResultSetHeader>(
     `INSERT INTO events (
       organizer_user_id, category_id, title, description, venue_name, venue_city, venue_country, venue_state, address,
-      latitude, longitude, starts_at, ends_at, is_b2b, is_b2c, tags, require_booking_approval, status, published_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      latitude, longitude, starts_at, ends_at, is_b2b, is_b2c, tags, require_booking_approval, entry_qr_allow_reentry, status, published_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       input.organizerUserId,
       input.categoryId,
@@ -82,11 +86,28 @@ export async function insertEvent(
       input.isB2c ? 1 : 0,
       input.tags ? JSON.stringify(input.tags) : null,
       input.requireBookingApproval ? 1 : 0,
+      input.entryQrAllowReentry ? 1 : 0,
       input.status,
       input.status === "published" ? new Date() : null,
     ]
   );
   return BigInt(result.insertId);
+}
+
+export async function countOrganizerEvents(
+  pool: Pool,
+  organizerUserId: bigint,
+  filter: "all_non_cancelled" | "published"
+): Promise<number> {
+  const clause =
+    filter === "published"
+      ? "status = 'published'"
+      : "status IN ('draft','published')";
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS c FROM events WHERE organizer_user_id = ? AND ${clause}`,
+    [organizerUserId]
+  );
+  return Number(rows[0]?.c ?? 0);
 }
 
 export async function updateEvent(
@@ -110,6 +131,7 @@ export async function updateEvent(
     isB2c: boolean;
     tags: string[] | null;
     requireBookingApproval: boolean;
+    entryQrAllowReentry: boolean;
     status: "draft" | "published" | "cancelled";
   }>
 ): Promise<boolean> {
@@ -179,6 +201,10 @@ export async function updateEvent(
     fields.push("require_booking_approval = ?");
     vals.push(patch.requireBookingApproval ? 1 : 0);
   }
+  if (patch.entryQrAllowReentry !== undefined) {
+    fields.push("entry_qr_allow_reentry = ?");
+    vals.push(patch.entryQrAllowReentry ? 1 : 0);
+  }
   if (patch.status !== undefined) {
     fields.push("status = ?");
     vals.push(patch.status);
@@ -204,74 +230,97 @@ export async function findEventById(pool: Pool, id: bigint): Promise<EventRow | 
   return mapEvent(rows[0]);
 }
 
-export async function listPublishedEvents(
-  pool: Pool,
-  opts?: {
-    search?: string;
-    categoryId?: number;
-    b2bOnly?: boolean;
-    b2cOnly?: boolean;
-    /** Partial match, case-insensitive */
-    venueCity?: string;
-    /** Partial match, case-insensitive */
-    venueState?: string;
-    /** Inclusive calendar day (YYYY-MM-DD): events that end on or after this day start */
-    dateFrom?: string;
-    /** Inclusive calendar day (YYYY-MM-DD): events that start on or before this day end */
-    dateTo?: string;
-    /** Only rows favorited by this user */
-    favoritesUserId?: bigint;
-  }
-): Promise<EventRow[]> {
+export type PublishedEventsListOpts = {
+  search?: string;
+  categoryId?: number;
+  b2bOnly?: boolean;
+  b2cOnly?: boolean;
+  /** Partial match, case-insensitive */
+  venueCity?: string;
+  /** Partial match, case-insensitive */
+  venueState?: string;
+  /** Inclusive calendar day (YYYY-MM-DD): events that end on or after this day start */
+  dateFrom?: string;
+  /** Inclusive calendar day (YYYY-MM-DD): events that start on or before this day end */
+  dateTo?: string;
+  /** Only rows favorited by this user */
+  favoritesUserId?: bigint;
+};
+
+function buildPublishedEventsFilters(opts: PublishedEventsListOpts = {}) {
   const clauses: string[] = ["events.status = 'published'", "events.ends_at >= NOW()"];
   const params: unknown[] = [];
-  const search = opts?.search?.trim();
+  const search = opts.search?.trim();
   if (search) {
     clauses.push("(events.title LIKE ? OR events.description LIKE ?)");
     const q = `%${search}%`;
     params.push(q, q);
   }
-  if (opts?.categoryId != null && opts.categoryId > 0) {
+  if (opts.categoryId != null && opts.categoryId > 0) {
     clauses.push(
       "(events.category_id = ? OR EXISTS (SELECT 1 FROM event_category_links ecl WHERE ecl.event_id = events.id AND ecl.category_id = ?))"
     );
     params.push(opts.categoryId, opts.categoryId);
   }
-  if (opts?.b2bOnly) {
+  if (opts.b2bOnly) {
     clauses.push("events.is_b2b = 1");
   }
-  if (opts?.b2cOnly) {
+  if (opts.b2cOnly) {
     clauses.push("events.is_b2c = 1");
   }
-  const city = opts?.venueCity?.trim();
+  const city = opts.venueCity?.trim();
   if (city) {
     clauses.push("events.venue_city IS NOT NULL AND LOWER(events.venue_city) LIKE LOWER(?)");
     params.push(`%${city}%`);
   }
-  const st = opts?.venueState?.trim();
+  const st = opts.venueState?.trim();
   if (st) {
     clauses.push("events.venue_state IS NOT NULL AND LOWER(events.venue_state) LIKE LOWER(?)");
     params.push(`%${st}%`);
   }
-  const df = opts?.dateFrom?.trim();
+  const df = opts.dateFrom?.trim();
   if (df && /^\d{4}-\d{2}-\d{2}$/.test(df)) {
     clauses.push("events.ends_at >= ?");
     params.push(`${df} 00:00:00`);
   }
-  const dt = opts?.dateTo?.trim();
+  const dt = opts.dateTo?.trim();
   if (dt && /^\d{4}-\d{2}-\d{2}$/.test(dt)) {
     clauses.push("events.starts_at <= ?");
     params.push(`${dt} 23:59:59`);
   }
-  if (opts?.favoritesUserId != null) {
+  if (opts.favoritesUserId != null) {
     clauses.push(
       "EXISTS (SELECT 1 FROM exhibitor_event_favorites f WHERE f.event_id = events.id AND f.user_id = ?)"
     );
     params.push(opts.favoritesUserId);
   }
+  return { clauses, params };
+}
+
+export async function listPublishedEvents(pool: Pool, opts?: PublishedEventsListOpts): Promise<EventRow[]> {
+  const { clauses, params } = buildPublishedEventsFilters(opts);
   const sql = `SELECT events.* FROM events WHERE ${clauses.join(" AND ")} ORDER BY events.starts_at ASC`;
   const [rows] = await pool.query<RowDataPacket[]>(sql, params);
   return rows.map((r) => mapEvent(r));
+}
+
+/** Same filters as {@link listPublishedEvents}, plus first gallery/banner image per event. */
+export async function listPublishedEventsWithCover(
+  pool: Pool,
+  opts?: PublishedEventsListOpts
+): Promise<{ event: EventRow; coverImageUrl: string | null }[]> {
+  const { clauses, params } = buildPublishedEventsFilters(opts);
+  const sql = `SELECT events.*,
+    (SELECT em.url FROM event_media em
+     WHERE em.event_id = events.id AND em.media_type IN ('image', 'other')
+     ORDER BY em.sort_order ASC, em.id ASC LIMIT 1) AS cover_image_url
+    FROM events WHERE ${clauses.join(" AND ")} ORDER BY events.starts_at ASC`;
+  const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+  return rows.map((r) => {
+    const cover = r.cover_image_url != null && String(r.cover_image_url).trim() !== "" ? String(r.cover_image_url) : null;
+    const { cover_image_url: _drop, ...rest } = r as RowDataPacket & { cover_image_url?: string | null };
+    return { event: mapEvent(rest), coverImageUrl: cover };
+  });
 }
 
 const SEED_EVENT_CATEGORIES_SQL = `INSERT IGNORE INTO event_categories (name, slug, sort_order) VALUES

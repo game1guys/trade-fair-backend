@@ -2,24 +2,50 @@ import type { Pool } from "mysql2/promise";
 import type { ResultSetHeader } from "mysql2";
 import type { RowDataPacket } from "mysql2";
 import * as paymentRepo from "../repositories/paymentRepository.js";
+import * as marketplaceRepo from "../repositories/marketplaceRepository.js";
 import * as settingsRepo from "../repositories/settingsRepository.js";
 import { randomToken, sha256Hex } from "../utils/crypto.js";
 import { ensureInvoiceForPayment } from "./invoiceService.js";
+import { maybeRouteTransferOrganizerShareAfterBookingPayment } from "./stallBookingPayoutService.js";
+import {
+  emailLater,
+  notifyAfterPaymentRecorded,
+  notifyStallBookingConfirmed,
+  notifyTicketOrderConfirmed,
+} from "./transactionalEmail.js";
 
-async function calculateCommission(pool: Pool, amountMinor: bigint, type: "stall" | "ticket" | "service"): Promise<{ commissionMinor: bigint; gstMinor: bigint }> {
+async function calculateTicketOrServiceCommission(
+  pool: Pool,
+  amountMinor: bigint,
+  type: "ticket" | "service"
+): Promise<{ commissionMinor: bigint; gstMinor: bigint }> {
   const setting = await settingsRepo.getSetting(pool, "monetization_config");
-  const config = setting?.value || { stall_commission_pct: 10, ticket_commission_pct: 10, service_commission_pct: 10 };
-  
-  let pct = 10;
-  if (type === "stall") pct = Number(config.stall_commission_pct ?? 10);
-  if (type === "ticket") pct = Number(config.ticket_commission_pct ?? 10);
-  if (type === "service") pct = Number(config.service_commission_pct ?? 10);
+  const config = setting?.value || { ticket_commission_pct: 10, service_commission_pct: 10 };
+
+  const pct =
+    type === "ticket"
+      ? Number((config as { ticket_commission_pct?: number }).ticket_commission_pct ?? 10)
+      : Number((config as { service_commission_pct?: number }).service_commission_pct ?? 10);
 
   const commissionMinor = (amountMinor * BigInt(pct)) / 100n;
-  const gstPct = Number(config.gst_pct ?? 18);
+  const gstPct = Number((config as { gst_pct?: number }).gst_pct ?? 18);
   const gstMinor = (commissionMinor * BigInt(gstPct)) / 100n;
 
   return { commissionMinor, gstMinor };
+}
+
+async function calculateStallBookingCommission(
+  pool: Pool,
+  eventId: bigint,
+  amountMinor: bigint
+): Promise<{ commissionMinor: bigint; gstMinor: bigint; stallBookingCommissionBps: number }> {
+  const bps = await marketplaceRepo.getStallBookingCommissionBpsForEvent(pool, eventId);
+  const commissionMinor = (amountMinor * BigInt(bps)) / 10000n;
+  const setting = await settingsRepo.getSetting(pool, "monetization_config");
+  const config = setting?.value || { gst_pct: 18 };
+  const gstPct = Number((config as { gst_pct?: number }).gst_pct ?? 18);
+  const gstMinor = (commissionMinor * BigInt(gstPct)) / 100n;
+  return { commissionMinor, gstMinor, stallBookingCommissionBps: bps };
 }
 
 /** Idempotent: confirms exhibitor stall booking after Razorpay payment (manual verify or webhook). */
@@ -58,6 +84,7 @@ export async function finalizeBookingIfPending(pool: Pool, bookingId: bigint): P
       await conn.query("DELETE FROM stall_holds WHERE stall_id = ?", [row.stall_id]);
     }
     await conn.commit();
+    emailLater(() => notifyStallBookingConfirmed(pool, bookingId));
     return true;
   } catch (e) {
     await conn.rollback();
@@ -76,9 +103,14 @@ export async function insertBookingPaymentRecord(
     razorpayOrderId: string;
     razorpayPaymentId: string;
     bookingId: bigint;
+    eventId: bigint;
   }
-): Promise<void> {
-  const { commissionMinor, gstMinor } = await calculateCommission(pool, input.amountMinor, "stall");
+): Promise<bigint> {
+  const { commissionMinor, gstMinor, stallBookingCommissionBps } = await calculateStallBookingCommission(
+    pool,
+    input.eventId,
+    input.amountMinor
+  );
   const paymentId = await paymentRepo.insertPayment(pool, {
     payerUserId: input.payerUserId,
     amountMinor: input.amountMinor,
@@ -89,9 +121,21 @@ export async function insertBookingPaymentRecord(
     bookingId: input.bookingId,
     ticketOrderId: null,
     serviceBookingId: null,
-    metadata: { commissionMinor: String(commissionMinor), gstMinor: String(gstMinor) },
+    metadata: {
+      commissionMinor: String(commissionMinor),
+      gstMinor: String(gstMinor),
+      stallBookingCommissionBps,
+    },
   });
   await ensureInvoiceForPayment(pool, paymentId);
+  await maybeRouteTransferOrganizerShareAfterBookingPayment(pool, {
+    paymentId,
+    eventId: input.eventId,
+    razorpayPaymentId: input.razorpayPaymentId,
+    grossMinor: input.amountMinor,
+  });
+  emailLater(() => notifyAfterPaymentRecorded(pool, paymentId));
+  return paymentId;
 }
 
 /** Idempotent: fulfills visitor ticket order (paid path) after Razorpay. */
@@ -159,6 +203,7 @@ export async function finalizeTicketOrderIfPending(
 
     await conn.query("UPDATE ticket_orders SET status = 'paid' WHERE id = ?", [orderId]);
     await conn.commit();
+    emailLater(() => notifyTicketOrderConfirmed(pool, orderId, ticketsOut));
     return { tickets: ticketsOut };
   } catch (e) {
     await conn.rollback();
@@ -178,7 +223,7 @@ export async function insertTicketOrderPaymentRecord(
     ticketOrderId: bigint;
   }
 ): Promise<void> {
-  const { commissionMinor, gstMinor } = await calculateCommission(pool, input.amountMinor, "ticket");
+  const { commissionMinor, gstMinor } = await calculateTicketOrServiceCommission(pool, input.amountMinor, "ticket");
   const paymentId = await paymentRepo.insertPayment(pool, {
     payerUserId: input.payerUserId,
     amountMinor: input.amountMinor,
@@ -192,6 +237,7 @@ export async function insertTicketOrderPaymentRecord(
     metadata: { commissionMinor: String(commissionMinor), gstMinor: String(gstMinor) },
   });
   await ensureInvoiceForPayment(pool, paymentId);
+  emailLater(() => notifyAfterPaymentRecorded(pool, paymentId));
 }
 
 export async function insertServiceBookingPaymentRecord(
@@ -205,7 +251,8 @@ export async function insertServiceBookingPaymentRecord(
     metadata?: Record<string, unknown> | null;
   }
 ): Promise<void> {
-  const { commissionMinor, gstMinor } = await calculateCommission(pool, input.amountMinor, "service");
+  const commissionMinor = 0n;
+  const gstMinor = 0n;
   const paymentId = await paymentRepo.insertPayment(pool, {
     payerUserId: input.payerUserId,
     amountMinor: input.amountMinor,
@@ -219,4 +266,5 @@ export async function insertServiceBookingPaymentRecord(
     metadata: { ...input.metadata, commissionMinor: String(commissionMinor), gstMinor: String(gstMinor) },
   });
   await ensureInvoiceForPayment(pool, paymentId);
+  emailLater(() => notifyAfterPaymentRecorded(pool, paymentId));
 }

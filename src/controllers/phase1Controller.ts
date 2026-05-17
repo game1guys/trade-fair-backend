@@ -15,18 +15,28 @@ import * as stallHoldRepo from "../repositories/stallHoldRepository.js";
 import * as ticketRepo from "../repositories/ticketOrderRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as moderationRepo from "../repositories/moderationRepository.js";
+import * as marketplaceRepo from "../repositories/marketplaceRepository.js";
 import * as eventReminderRepo from "../repositories/eventReminderRepository.js";
 import * as organizerCommRepo from "../repositories/organizerCommunicationRepository.js";
+import * as organizerPayoutRepo from "../repositories/organizerPayoutRepository.js";
+import * as organizerRouteOnboarding from "../services/organizerRouteOnboardingService.js";
 import * as razorpay from "../services/razorpayService.js";
+import * as subscriptionAccess from "../services/subscriptionAccessService.js";
 import { ensureInvoiceForPayment } from "../services/invoiceService.js";
 import { insertBookingPaymentRecord, insertTicketOrderPaymentRecord } from "../services/paymentFinalizeService.js";
 import { sha256Hex, randomToken } from "../utils/crypto.js";
 import { HttpError } from "../utils/httpError.js";
+import { marketplaceDealStage } from "../utils/marketplaceDealStage.js";
 import { verifyAccessToken } from "../utils/jwt.js";
 import { allowDemoVisitorTickets, env } from "../config/env.js";
 import { z } from "zod";
 import { emitGateScan, subscribeGateScan } from "../realtime/gateBus.js";
 import { sendSmtpEmail, sendWhatsAppCloud } from "../services/outboundMessaging.js";
+import {
+  emailLater,
+  notifyStallBookingConfirmed,
+  notifyTicketOrderConfirmed,
+} from "../services/transactionalEmail.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
 import type { EventRow } from "../repositories/eventRepository.js";
 import {
@@ -40,6 +50,7 @@ import {
   organizerBookingReassignSchema,
   exhibitorProfileSchema,
   organizerBulkCommunicationSchema,
+  organizerPayoutProfilePutSchema,
   razorpayCreateOrderSchema,
   scanPayloadSchema,
   stallBulkCreateSchema,
@@ -157,6 +168,7 @@ function serializeEvent(e: EventRow) {
     createdAt: e.created_at,
     updatedAt: e.updated_at,
     requireBookingApproval: Boolean((e as EventRow).require_booking_approval),
+    entryQrAllowReentry: Boolean((e as EventRow).entry_qr_allow_reentry),
   };
 }
 
@@ -173,7 +185,7 @@ export function createPhase1Controller(pool: Pool) {
       const venueState = typeof req.query.venueState === "string" ? req.query.venueState : undefined;
       const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom : undefined;
       const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo : undefined;
-      const rows = await eventRepo.listPublishedEvents(pool, {
+      const rows = await eventRepo.listPublishedEventsWithCover(pool, {
         search,
         categoryId,
         b2bOnly: b2bOnly || undefined,
@@ -183,7 +195,12 @@ export function createPhase1Controller(pool: Pool) {
         dateFrom,
         dateTo,
       });
-      res.json({ events: rows.map(serializeEvent) });
+      res.json({
+        events: rows.map(({ event, coverImageUrl }) => ({
+          ...serializeEvent(event),
+          coverImageUrl,
+        })),
+      });
     },
 
     listPublicEventCategories: async (_req: AuthedRequest, res: Response) => {
@@ -252,6 +269,13 @@ export function createPhase1Controller(pool: Pool) {
         })
         .parse(req.body);
 
+      const event = await eventRepo.findEventById(pool, eventId);
+      if (!event || String(event.status) !== "published") throw new HttpError(404, "Event not found");
+      const eventEnd = event.ends_at ? new Date(event.ends_at) : new Date(event.starts_at);
+      if (eventEnd.getTime() > Date.now()) {
+        throw new HttpError(400, "Reviews are only available after the event has ended");
+      }
+
       // Check if user has a ticket for this event
       const [tickets] = await pool.query<RowDataPacket[]>(
         "SELECT id FROM tickets WHERE event_id = ? AND visitor_user_id = ? LIMIT 1",
@@ -295,8 +319,109 @@ export function createPhase1Controller(pool: Pool) {
       res.json({ event: { ...serializeEvent(ev), categoryIds: merged } });
     },
 
+    /** Enquiries & bookings for this fair (organizer as customer). */
+    organizerListEventMarketplaceDeals: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const rows = await marketplaceRepo.listEventMarketplaceDeals(pool, eventId, req.userId!);
+      res.json({
+        deals: rows.map((r) => {
+          const bookingStatus = r.booking_status != null ? String(r.booking_status) : null;
+          const requestStatus = String(r.request_status);
+          return {
+            requestId: String(r.request_id),
+            requestStatus,
+            enquiryCreatedAt: r.enquiry_created_at,
+            messagePreview:
+              String(r.message).length > 120 ? `${String(r.message).slice(0, 117)}…` : String(r.message),
+            bookingId: r.booking_id != null ? String(r.booking_id) : null,
+            bookingStatus,
+            bookingUpdatedAt: r.booking_updated_at ?? null,
+            amountMinor: r.amount_minor != null ? String(r.amount_minor) : null,
+            currency: r.currency != null ? String(r.currency) : null,
+            serviceId: String(r.service_id),
+            serviceTitle: String(r.service_title),
+            providerUserId: String(r.provider_user_id),
+            providerDisplayName: String(r.provider_display_name),
+            dealStage: marketplaceDealStage({
+              contractStatus: r.contract_status,
+              bookingStatus,
+              requestStatus,
+            }),
+            contractStatus: r.contract_status != null ? String(r.contract_status) : null,
+            contractAcceptedAt: r.contract_accepted_at ?? null,
+            contractServiceDescription:
+              r.contract_service_description != null ? String(r.contract_service_description) : null,
+            contractDurationDays:
+              r.contract_duration_days != null ? Number(r.contract_duration_days) : null,
+            contractPeopleCount: r.contract_people_count != null ? Number(r.contract_people_count) : null,
+            contractManpowerAvailable:
+              r.contract_manpower_available != null ? Number(r.contract_manpower_available) : null,
+            contextEventTitle: r.context_event_title != null ? String(r.context_event_title) : null,
+            contextEventVenue: r.context_event_venue != null ? String(r.context_event_venue) : null,
+            contextEventStartsAt: r.context_event_starts_at ?? null,
+            contextEventEndsAt: r.context_event_ends_at ?? null,
+          };
+        }),
+      });
+    },
+
+    /** Published marketplace listings scoped for organizers managing one fair — attach enquiries via POST marketplace … + eventId. */
+    organizerListMarketplaceServicesForEvent: async (req: AuthedRequest, res: Response) => {
+      const eventId = pid(req.params.eventId);
+      const ev = await eventRepo.findEventById(pool, eventId);
+      if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      const categoryId =
+        typeof req.query.categoryId === "string" && req.query.categoryId.match(/^\d+$/)
+          ? Number(req.query.categoryId)
+          : undefined;
+      const search = typeof req.query.search === "string" ? req.query.search : undefined;
+      const rows = await marketplaceRepo.listPublishedServices(pool, { categoryId, search });
+      res.json({
+        event: {
+          id: String(ev.id),
+          title: ev.title,
+          venueName: ev.venue_name,
+          venueCity: ev.venue_city ?? null,
+          startsAt: ev.starts_at,
+          endsAt: ev.ends_at,
+          status: ev.status,
+        },
+        services: rows.map((r) => ({
+          id: String(r.id),
+          categoryId: Number(r.category_id),
+          title: String(r.title),
+          description:
+            r.description != null ? (String(r.description).length > 400 ? `${String(r.description).slice(0, 397)}…` : String(r.description)) : null,
+          priceMinor: String(r.price_minor),
+          currency: String(r.currency),
+          categoryName: String(r.category_name),
+          companyName: r.company_name != null ? String(r.company_name) : null,
+          coverImageUrl: r.cover_image_url != null ? String(r.cover_image_url) : null,
+          imageUrls: marketplaceRepo.parseServiceImageUrls(r.image_urls),
+          serviceArea: r.service_area != null ? String(r.service_area) : null,
+          leadTimeDays: r.lead_time_days != null ? Number(r.lead_time_days) : null,
+          yearsInBusiness: r.years_in_business != null ? Number(r.years_in_business) : null,
+          organizerRatingAvg: r.organizer_rating_avg != null ? Number(r.organizer_rating_avg) : null,
+          organizerRatingCount:
+            r.organizer_rating_count != null ? Number(r.organizer_rating_count) : 0,
+          deliveryNotes:
+            r.delivery_notes != null
+              ? String(r.delivery_notes).length > 220
+                ? `${String(r.delivery_notes).slice(0, 217)}…`
+                : String(r.delivery_notes)
+              : null,
+        })),
+      });
+    },
+
     organizerCreateEvent: async (req: AuthedRequest, res: Response) => {
       const body = createEventSchema.parse(req.body);
+      await subscriptionAccess.assertOrganizerCanCreateEvent(pool, req.userId!);
+      if (body.status === "published") {
+        await subscriptionAccess.assertOrganizerCanPublishNewEvent(pool, req.userId!);
+      }
       const primaryCategory =
         body.categoryIds && body.categoryIds.length > 0
           ? body.categoryIds[0]!
@@ -319,6 +444,7 @@ export function createPhase1Controller(pool: Pool) {
         isB2c: body.isB2c,
         tags: body.tags ?? null,
         requireBookingApproval: body.requireBookingApproval,
+        entryQrAllowReentry: body.entryQrAllowReentry,
         status: body.status,
       });
       const linkIds = body.categoryIds?.length ? body.categoryIds : primaryCategory != null ? [primaryCategory] : [];
@@ -331,6 +457,9 @@ export function createPhase1Controller(pool: Pool) {
     organizerUpdateEvent: async (req: AuthedRequest, res: Response) => {
       const eventId = pid(req.params.eventId);
       const body = updateEventSchema.parse(req.body);
+      if (body.status === "published") {
+        await subscriptionAccess.assertOrganizerCanPublishEvent(pool, req.userId!, eventId);
+      }
       let legacyCat = body.categoryId;
       if (body.categoryIds !== undefined) {
         legacyCat = body.categoryIds.length ? body.categoryIds[0]! : null;
@@ -353,6 +482,7 @@ export function createPhase1Controller(pool: Pool) {
         isB2c: body.isB2c,
         tags: body.tags,
         requireBookingApproval: body.requireBookingApproval,
+        entryQrAllowReentry: body.entryQrAllowReentry,
         status: body.status,
       });
       if (!ok) throw new HttpError(404, "Event not found");
@@ -367,6 +497,7 @@ export function createPhase1Controller(pool: Pool) {
       const eventId = pid(req.params.eventId);
       const ev = await eventRepo.findEventById(pool, eventId);
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
+      await subscriptionAccess.assertOrganizerCanPublishEvent(pool, req.userId!, eventId);
       const ok = await eventRepo.updateEvent(pool, eventId, req.userId!, { status: "published" });
       if (!ok) throw new HttpError(404, "Event not found");
       await moderationRepo.ensureOpenFlag(pool, { entityType: "event", entityId: String(eventId) });
@@ -626,6 +757,9 @@ export function createPhase1Controller(pool: Pool) {
         }
 
         await conn.commit();
+        if (!needApproval && subtotal === 0n) {
+          emailLater(() => notifyStallBookingConfirmed(pool, bookingId));
+        }
         res.status(201).json({
           bookingId: String(bookingId),
           subtotalMinor: String(subtotal),
@@ -680,12 +814,14 @@ export function createPhase1Controller(pool: Pool) {
           await conn.query("DELETE FROM stall_holds WHERE stall_id = ?", [row.stall_id]);
         }
         await conn.commit();
+        emailLater(() => notifyStallBookingConfirmed(pool, bookingId));
         await insertBookingPaymentRecord(pool, {
           payerUserId: req.userId!,
           amountMinor: booking.subtotal_minor,
           razorpayOrderId: body.razorpayOrderId,
           razorpayPaymentId: body.razorpayPaymentId,
           bookingId,
+          eventId: booking.event_id,
         });
         res.json({ ok: true });
       } catch (e) {
@@ -752,6 +888,7 @@ export function createPhase1Controller(pool: Pool) {
           const orderId = BigInt(tor.insertId);
           const ticketsOut = await insertTicketsForOrder(conn, orderId);
           await conn.commit();
+          emailLater(() => notifyTicketOrderConfirmed(pool, orderId, ticketsOut));
           res.status(201).json({
             ticketOrderId: String(orderId),
             totalMinor: "0",
@@ -846,6 +983,7 @@ export function createPhase1Controller(pool: Pool) {
           [orderId, req.userId!]
         );
         await conn.commit();
+        emailLater(() => notifyTicketOrderConfirmed(pool, orderId, ticketsOut));
         await insertTicketOrderPaymentRecord(pool, {
           payerUserId: req.userId!,
           amountMinor: order.total_minor,
@@ -967,86 +1105,13 @@ export function createPhase1Controller(pool: Pool) {
       const body = scanPayloadSchema.parse(req.body);
       const ev = await eventRepo.findEventById(pool, eventId);
       if (!ev || ev.organizer_user_id !== req.userId!) throw new HttpError(404, "Event not found");
-
-      const parts = body.payload.trim().split(".");
-      if (parts.length !== 3 || parts[0] !== "TFW1") throw new HttpError(400, "Invalid QR format");
-      const ticketId = BigInt(parts[1]);
-      const raw = parts[2];
-      const hash = sha256Hex(raw);
-      const row = await ticketRepo.findTicketByQrHash(pool, hash);
-      if (!row) {
-        await ticketRepo.insertEntryScan(pool, {
-          ticketId: null,
-          eventId,
-          scannedByUserId: req.userId!,
-          result: "invalid",
-        });
-        emitGateScan(eventId, {
-          result: "invalid",
-          ticketId: null,
-          scannedAt: new Date().toISOString(),
-        });
-        res.json({ result: "invalid" });
-        return;
-      }
-      if (row.event_id !== eventId) {
-        await ticketRepo.insertEntryScan(pool, {
-          ticketId: row.ticket_id,
-          eventId,
-          scannedByUserId: req.userId!,
-          result: "wrong_event",
-        });
-        emitGateScan(eventId, {
-          result: "wrong_event",
-          ticketId: String(row.ticket_id),
-          scannedAt: new Date().toISOString(),
-        });
-        res.json({ result: "wrong_event" });
-        return;
-      }
-      if (row.status !== "unused") {
-        await ticketRepo.insertEntryScan(pool, {
-          ticketId: row.ticket_id,
-          eventId,
-          scannedByUserId: req.userId!,
-          result: "already_used",
-        });
-        emitGateScan(eventId, {
-          result: "already_used",
-          ticketId: String(row.ticket_id),
-          scannedAt: new Date().toISOString(),
-        });
-        res.json({ result: "already_used" });
-        return;
-      }
-      const used = await ticketRepo.markTicketUsed(pool, row.ticket_id);
-      if (!used) {
-        await ticketRepo.insertEntryScan(pool, {
-          ticketId: row.ticket_id,
-          eventId,
-          scannedByUserId: req.userId!,
-          result: "already_used",
-        });
-        emitGateScan(eventId, {
-          result: "already_used",
-          ticketId: String(row.ticket_id),
-          scannedAt: new Date().toISOString(),
-        });
-        res.json({ result: "already_used" });
-        return;
-      }
-      await ticketRepo.insertEntryScan(pool, {
-        ticketId: row.ticket_id,
+      const { processVisitorQrScan } = await import("../services/entryScanService.js");
+      const result = await processVisitorQrScan(pool, {
         eventId,
+        payload: body.payload,
         scannedByUserId: req.userId!,
-        result: "valid",
       });
-      emitGateScan(eventId, {
-        result: "valid",
-        ticketId: String(row.ticket_id),
-        scannedAt: new Date().toISOString(),
-      });
-      res.json({ result: "valid", ticketId: String(row.ticket_id) });
+      res.json(result);
     },
 
     /** Server-Sent Events: live gate scan feed for organizers (use ?access_token=… when EventSource cannot send Authorization). */
@@ -1164,6 +1229,9 @@ export function createPhase1Controller(pool: Pool) {
         if (r.code === "bad_status") throw new HttpError(400, "Booking is not awaiting organizer approval");
         if (r.code === "payment_setup_failed") throw new HttpError(502, r.message ?? "Could not create payment order");
         throw new HttpError(500, "Unknown error");
+      }
+      if (r.razorpayOrderId == null) {
+        emailLater(() => notifyStallBookingConfirmed(pool, bookingId));
       }
       res.json({
         ok: true,
@@ -1432,7 +1500,7 @@ export function createPhase1Controller(pool: Pool) {
       const dateFrom = typeof req.query.dateFrom === "string" ? req.query.dateFrom : undefined;
       const dateTo = typeof req.query.dateTo === "string" ? req.query.dateTo : undefined;
       const favoritesOnly = req.query.favorites === "1" || req.query.favorites === "true";
-      const rows = await eventRepo.listPublishedEvents(pool, {
+      const rows = await eventRepo.listPublishedEventsWithCover(pool, {
         search,
         categoryId,
         b2bOnly: b2bOnly || undefined,
@@ -1445,7 +1513,10 @@ export function createPhase1Controller(pool: Pool) {
       });
       const favoriteIds = await exhibitorFavoriteRepo.listFavoriteEventIdsForUser(pool, req.userId!);
       res.json({
-        events: rows.map(serializeEvent),
+        events: rows.map(({ event, coverImageUrl }) => ({
+          ...serializeEvent(event),
+          coverImageUrl,
+        })),
         favoriteEventIds: favoriteIds.map((id) => String(id)),
       });
     },
@@ -1670,6 +1741,116 @@ export function createPhase1Controller(pool: Pool) {
       }
 
       res.json({ ok: true });
+    },
+
+    organizerGetPayoutProfile: async (req: AuthedRequest, res: Response) => {
+      const flags = {
+        routeTransfersEnabled: env.razorpay.routeTransfersEnabled,
+        routeAutoLinkedAccount: env.razorpay.routeAutoLinkedAccount,
+      };
+      const row = await organizerPayoutRepo.findOrganizerPayoutProfile(pool, req.userId!);
+      if (!row) {
+        res.json({
+          profile: null,
+          ...flags,
+        });
+        return;
+      }
+      res.json({
+        profile: {
+          accountHolderName: row.accountHolderName,
+          bankAccountNumber: row.bankAccountNumber,
+          ifsc: row.ifsc,
+          upiId: row.upiId,
+          razorpayLinkedAccountId: row.razorpayLinkedAccountId,
+          updatedAt: row.updatedAt,
+        },
+        ...flags,
+      });
+    },
+
+    organizerPutPayoutProfile: async (req: AuthedRequest, res: Response) => {
+      const body = organizerPayoutProfilePutSchema.parse(req.body);
+      const bankNum = (body.bankAccountNumber ?? "").replace(/\s/g, "") || null;
+      const ifsc = body.ifsc?.trim().toUpperCase() || null;
+      const upi = body.upiId?.trim() || null;
+      const linked = body.razorpayLinkedAccountId?.trim() || null;
+      const stakeholderPan = body.stakeholderPan?.trim().toUpperCase() || undefined;
+      let holder = body.accountHolderName?.trim() ?? "";
+      if (!holder) {
+        if (upi) holder = upi.split("@")[0]?.slice(0, 255) || "UPI";
+        else if (bankNum) holder = "Bank account";
+        else holder = "Organizer";
+      }
+
+      const existing = await organizerPayoutRepo.findOrganizerPayoutProfile(pool, req.userId!);
+      const flags = {
+        routeTransfersEnabled: env.razorpay.routeTransfersEnabled,
+        routeAutoLinkedAccount: env.razorpay.routeAutoLinkedAccount,
+      };
+
+      let resolvedLinked: string | null = linked;
+      let routeOnboarding: "off" | "skipped_manual_linked" | "skipped_has_linked" | "skipped_no_bank" | "skipped_missing_contact" | "created" | "failed" =
+        env.razorpay.routeAutoLinkedAccount ? "skipped_no_bank" : "off";
+      let routeOnboardingDetail: string | undefined;
+
+      if (linked) {
+        routeOnboarding = "skipped_manual_linked";
+      } else if (!env.razorpay.routeAutoLinkedAccount) {
+        routeOnboarding = "off";
+        resolvedLinked = linked ?? existing?.razorpayLinkedAccountId ?? null;
+      } else if (!bankNum || !ifsc) {
+        routeOnboarding = "skipped_no_bank";
+        resolvedLinked = existing?.razorpayLinkedAccountId ?? null;
+      } else if (existing?.razorpayLinkedAccountId) {
+        routeOnboarding = "skipped_has_linked";
+        resolvedLinked = existing.razorpayLinkedAccountId;
+      } else {
+        const user = await userRepo.findUserById(pool, req.userId!);
+        const phoneNorm = organizerRouteOnboarding.normalizeIndianPhoneDigits(user?.phone ?? undefined);
+        if (!user?.email || !phoneNorm) {
+          routeOnboarding = "skipped_missing_contact";
+          routeOnboardingDetail =
+            "Route auto-setup ke liye Account par email aur phone number hona zaroori hai (Account settings).";
+          resolvedLinked = null;
+        } else {
+          try {
+            resolvedLinked = await organizerRouteOnboarding.createRouteLinkedAccountForOrganizer({
+              userId: req.userId!,
+              email: user.email,
+              phoneDigits: phoneNorm,
+              legalBusinessName: holder,
+              contactName: holder,
+              bankAccountNumber: bankNum,
+              ifsc,
+              beneficiaryName: holder,
+              stakeholderPan,
+            });
+            routeOnboarding = "created";
+          } catch (e) {
+            routeOnboarding = "failed";
+            routeOnboardingDetail = e instanceof Error ? e.message : String(e);
+            resolvedLinked = existing?.razorpayLinkedAccountId ?? null;
+          }
+        }
+      }
+
+      await organizerPayoutRepo.upsertOrganizerPayoutProfile(pool, {
+        userId: req.userId!,
+        accountHolderName: holder,
+        bankAccountNumber: bankNum,
+        ifsc,
+        upiId: upi,
+        razorpayLinkedAccountId: resolvedLinked,
+      });
+
+      res.json({
+        ok: true,
+        razorpayLinkedAccountId: resolvedLinked,
+        routeOnboarding,
+        routeOnboardingDetail,
+        ...flags,
+      });
     },
 
     exhibitorListBookings: async (req: AuthedRequest, res: Response) => {

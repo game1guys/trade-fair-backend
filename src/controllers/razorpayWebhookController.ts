@@ -57,6 +57,7 @@ export function createRazorpayWebhookHandler(pool: Pool) {
           razorpayOrderId: orderId,
           razorpayPaymentId: paymentId,
           bookingId: booking.id,
+          eventId: booking.event_id,
         });
       }
       return res.json({ ok: true, type: "booking" });

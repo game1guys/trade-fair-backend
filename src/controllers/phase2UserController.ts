@@ -11,56 +11,68 @@ import { HttpError } from "../utils/httpError.js";
 import type { AuthedRequest } from "../middlewares/authMiddleware.js";
 import { disputeCreateSchema, kycSubmitSchema, supportAttachmentCreateSchema, supportCreateSchema, supportResponseCreateSchema } from "../validators/phase2Schemas.js";
 
-const KYC_UPLOAD_ROLES = new Set(["EXHIBITOR", "ORGANIZER", "SERVICE_PROVIDER"]);
+/** Only organizers submit KYC documents (exhibitors and service providers do not). */
+const KYC_ROLE = "ORGANIZER";
 
-async function ensureRoleForKyc(pool: Pool, userId: bigint, roleCode: string): Promise<string[]> {
-  let roles = await userRepo.getRoleCodesForUser(pool, userId);
-  if (roleCode === "EXHIBITOR" && !roles.includes("EXHIBITOR")) {
-    await userRepo.assignRoleByCode(pool, userId, "EXHIBITOR");
-    roles = await userRepo.getRoleCodesForUser(pool, userId);
-  }
-  return roles;
+/** Organizer uploads must use one of these `docType` values (see organizer KYC UI). */
+const ORGANIZER_KYC_DOC_TYPES = new Set(["organizer_business_proof", "aadhaar_card", "organizer_genuineness"]);
+
+function kycRoleAutoApproves(roleCode: string): boolean {
+  return roleCode.trim().toUpperCase() === KYC_ROLE;
 }
 
 export function createPhase2UserController(pool: Pool) {
   return {
     submitKyc: async (req: AuthedRequest, res: Response) => {
       const body = kycSubmitSchema.parse(req.body);
-      const roles = await ensureRoleForKyc(pool, req.userId!, body.roleCode);
-      if (!roles.includes(body.roleCode)) throw new HttpError(400, "Role mismatch for KYC submit");
-      if (body.roleCode === "VISITOR") throw new HttpError(400, "Visitors do not submit KYC in Phase 2");
+      const rc = body.roleCode.trim().toUpperCase();
+      if (rc !== KYC_ROLE) throw new HttpError(400, "KYC is only available for organizers.");
+      const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
+      if (!roles.includes(KYC_ROLE)) throw new HttpError(403, "You need the organizer role to submit KYC.");
       const id = await kycRepo.insertKycDocument(pool, {
         userId: req.userId!,
-        roleCode: body.roleCode,
+        roleCode: KYC_ROLE,
         docType: body.docType,
         docUrl: body.docUrl,
         meta: (body.meta as Record<string, unknown> | null) ?? null,
       });
+      if (env.autoApproveKycOnUpload && kycRoleAutoApproves(KYC_ROLE)) {
+        await kycRepo.markKycDocumentAutoApproved(pool, id, `auto-approved (${env.nodeEnv})`);
+      }
       await auditRepo.insertAuditLog(pool, {
         actorUserId: req.userId!,
         action: "KYC_SUBMIT",
         entityType: "kyc_document",
         entityId: String(id),
-        metadata: { roleCode: body.roleCode, docType: body.docType },
+        metadata: { roleCode: KYC_ROLE, docType: body.docType },
       });
       res.status(201).json({ id: String(id) });
     },
 
-    /** Multipart field name: `file`. Optional body: `roleCode` (default EXHIBITOR), `docType` (default gst_certificate). */
+    /** Multipart field name: `file`. Body: `roleCode` must be ORGANIZER; `docType` defaults to organizer_business_proof. */
     uploadKycDocument: async (req: AuthedRequest, res: Response) => {
       const file = (req as AuthedRequest & { file?: { filename: string; originalname: string; mimetype: string } }).file;
       if (!file) throw new HttpError(400, 'Missing file (multipart field name "file")');
 
-      const roleCodeRaw = typeof req.body?.roleCode === "string" ? req.body.roleCode.trim() : "EXHIBITOR";
-      if (!KYC_UPLOAD_ROLES.has(roleCodeRaw)) throw new HttpError(400, "Invalid roleCode for KYC upload");
+      const roleCodeRaw = (typeof req.body?.roleCode === "string" ? req.body.roleCode.trim().toUpperCase() : "") || KYC_ROLE;
+      if (roleCodeRaw !== KYC_ROLE) throw new HttpError(400, "KYC uploads are only for organizers.");
 
-      const roles = await ensureRoleForKyc(pool, req.userId!, roleCodeRaw);
-      if (!roles.includes(roleCodeRaw)) throw new HttpError(400, "Role mismatch for KYC upload");
+      const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
+      if (!roles.includes(KYC_ROLE)) throw new HttpError(403, "You need the organizer role to upload KYC.");
 
-      const docType =
+      const defaultDocType = "organizer_business_proof";
+      const docTypeRaw =
         typeof req.body?.docType === "string" && req.body.docType.trim().length >= 2
           ? req.body.docType.trim().slice(0, 64)
-          : "gst_certificate";
+          : "";
+      const docType = docTypeRaw || defaultDocType;
+
+      if (!ORGANIZER_KYC_DOC_TYPES.has(docType)) {
+        throw new HttpError(
+          400,
+          "Invalid docType for organizer. Use organizer_business_proof, aadhaar_card, or organizer_genuineness."
+        );
+      }
 
       const relativePath = `kyc/${req.userId}/${file.filename}`;
       const prefix = env.apiPrefix.startsWith("/") ? env.apiPrefix : `/${env.apiPrefix}`;
@@ -73,6 +85,9 @@ export function createPhase2UserController(pool: Pool) {
         docUrl,
         meta: { originalFilename: file.originalname, mimeType: file.mimetype },
       });
+      if (env.autoApproveKycOnUpload && kycRoleAutoApproves(roleCodeRaw)) {
+        await kycRepo.markKycDocumentAutoApproved(pool, id, `auto-approved (${env.nodeEnv})`);
+      }
       await auditRepo.insertAuditLog(pool, {
         actorUserId: req.userId!,
         action: "KYC_SUBMIT",
@@ -84,7 +99,12 @@ export function createPhase2UserController(pool: Pool) {
     },
 
     listMyKyc: async (req: AuthedRequest, res: Response) => {
-      const items = await kycRepo.listMyKyc(pool, req.userId!);
+      const q = typeof req.query.roleCode === "string" ? req.query.roleCode.trim().toUpperCase() : "";
+      if (q && q !== KYC_ROLE) {
+        res.json({ kyc: [] });
+        return;
+      }
+      const items = await kycRepo.listMyKyc(pool, req.userId!, { roleCode: KYC_ROLE });
       res.json({ kyc: items });
     },
 

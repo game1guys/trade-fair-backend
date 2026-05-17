@@ -6,6 +6,9 @@ import * as refreshRepo from "../repositories/refreshTokenRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as permissionRepo from "../repositories/permissionRepository.js";
 import * as subAdminScopeRepo from "../repositories/subAdminScopeRepository.js";
+import * as marketplaceRepo from "../repositories/marketplaceRepository.js";
+import * as kycRepo from "../repositories/kycRepository.js";
+import { parseLimitations } from "./subscriptionAccessService.js";
 import { sha256Hex } from "../utils/crypto.js";
 import { newJti } from "../utils/ids.js";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../utils/jwt.js";
@@ -51,10 +54,8 @@ export async function signup(
     await userRepo.assignRoleByCode(pool, userId, "EXHIBITOR");
   } else if (accountType === "organizer") {
     await userRepo.assignRoleByCode(pool, userId, "ORGANIZER");
-    await userRepo.setPendingAdminReview(pool, userId, true);
   } else if (accountType === "service_provider") {
     await userRepo.assignRoleByCode(pool, userId, "SERVICE_PROVIDER");
-    await userRepo.setPendingAdminReview(pool, userId, true);
   }
 
   const roles = await userRepo.getRoleCodesForUser(pool, userId);
@@ -261,7 +262,38 @@ export async function getMe(pool: Pool, userId: bigint) {
     roles.includes("SUB_ADMIN") && !roles.includes("SUPER_ADMIN")
       ? await subAdminScopeRepo.listScopesForSubAdmin(pool, userId)
       : [];
-  const pendingAdminReview = await userRepo.userNeedsAdminReview(pool, userId);
+  /** Account “pending review” is deprecated — only KYC + subscription gates apply. */
+  const pendingAdminReview = false;
+  const subscriptionByRole: Record<
+    string,
+    {
+      active: boolean;
+      planName?: string;
+      endsAt?: string;
+      limitations?: ReturnType<typeof parseLimitations>;
+      stallBookingCommissionBps?: number;
+    }
+  > = {};
+  for (const rc of ["ORGANIZER", "EXHIBITOR", "SERVICE_PROVIDER"] as const) {
+    if (roles.includes(rc)) {
+      const row = await marketplaceRepo.findActiveSubscriptionForRole(pool, userId, rc);
+      if (row) {
+        subscriptionByRole[rc] = {
+          active: true,
+          planName: String(row.plan_name),
+          endsAt: (row.ends_at as Date).toISOString(),
+          limitations: parseLimitations(row.limitations_json),
+          stallBookingCommissionBps:
+            row.stall_booking_commission_bps != null ? Number(row.stall_booking_commission_bps) : undefined,
+        };
+      } else {
+        subscriptionByRole[rc] = { active: false };
+      }
+    }
+  }
+  const organizerKycApproved = roles.includes("ORGANIZER")
+    ? await kycRepo.hasOrganizerIdentityKycApproved(pool, userId)
+    : false;
   return {
     id: String(user.id),
     email: user.email,
@@ -273,6 +305,8 @@ export async function getMe(pool: Pool, userId: bigint) {
     roles,
     permissions,
     subAdminScopes,
+    organizerKycApproved,
+    subscriptionByRole,
   };
 }
 

@@ -49,9 +49,23 @@ export const adminKycReviewSchema = z.object({
   remarks: z.string().max(2000).optional().nullable(),
 });
 
-export const subAdminCreateSchema = z.object({
-  userId: z.string().regex(/^\d+$/),
-});
+export const subAdminCreateSchema = z
+  .object({
+    userId: z.string().regex(/^\d+$/).optional(),
+    email: z.string().email().max(255).optional(),
+    password: z.string().min(8).max(128).optional(),
+    fullName: z.string().min(1).max(255).optional(),
+    phone: z.string().max(32).nullable().optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.userId) return;
+    if (!v.email || !v.password || !v.fullName) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide userId to promote an existing user, or email + password + fullName to create a new sub-admin",
+      });
+    }
+  });
 
 export const subAdminScopesPutSchema = z.object({
   scopes: z.array(z.string().min(1).max(64)).max(50),

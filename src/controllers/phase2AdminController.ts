@@ -2,10 +2,12 @@ import bcrypt from "bcryptjs";
 import type { Pool } from "mysql2/promise";
 import type { Response } from "express";
 import * as auditRepo from "../repositories/auditRepository.js";
+import { emailKycApprovedOrganizer, emailLater } from "../services/transactionalEmail.js";
 import * as kycRepo from "../repositories/kycRepository.js";
 import * as paymentRepo from "../repositories/paymentRepository.js";
 import * as settingsRepo from "../repositories/settingsRepository.js";
 import * as subScopeRepo from "../repositories/subAdminScopeRepository.js";
+import { SUB_ADMIN_DEFAULT_SCOPES } from "../repositories/subAdminScopeRepository.js";
 import * as supportRepo from "../repositories/supportRepository.js";
 import * as userRepo from "../repositories/userRepository.js";
 import * as notifRepo from "../repositories/notificationRepository.js";
@@ -48,6 +50,16 @@ async function actorIsSuperAdmin(pool: Pool, actorUserId: bigint): Promise<boole
   return roles.includes("SUPER_ADMIN");
 }
 
+async function assertCanManageSubAdmins(pool: Pool, actorUserId: bigint): Promise<void> {
+  if (await actorIsSuperAdmin(pool, actorUserId)) return;
+  const roles = await userRepo.getRoleCodesForUser(pool, actorUserId);
+  if (!roles.includes("SUB_ADMIN")) throw new HttpError(403, "Forbidden");
+  const scopes = await subScopeRepo.listScopesForSubAdmin(pool, actorUserId);
+  if (!scopes.includes("sub_admins")) {
+    throw new HttpError(403, "You do not have permission to manage sub-admins");
+  }
+}
+
 export function createPhase2AdminController(pool: Pool) {
   return {
     adminListUsers: async (req: AuthedRequest, res: Response) => {
@@ -85,6 +97,9 @@ export function createPhase2AdminController(pool: Pool) {
       const body = adminCreateUserSchema.parse(req.body);
       if (body.roleCodes.includes("SUPER_ADMIN") && !(await actorIsSuperAdmin(pool, req.userId!))) {
         throw new HttpError(403, "Only super admins can grant SUPER_ADMIN");
+      }
+      if (body.roleCodes.map((c) => c.toUpperCase()).includes("SUB_ADMIN") && !(await actorIsSuperAdmin(pool, req.userId!))) {
+        throw new HttpError(403, "Use Admin → Sub-admins to create or promote sub-admin accounts");
       }
       const email = body.email.toLowerCase().trim();
       const existing = await userRepo.findUserByEmail(pool, email);
@@ -154,6 +169,9 @@ export function createPhase2AdminController(pool: Pool) {
       if (rc === "SUPER_ADMIN" && !(await actorIsSuperAdmin(pool, req.userId!))) {
         throw new HttpError(403, "Only super admins can grant SUPER_ADMIN");
       }
+      if (rc === "SUB_ADMIN" && !(await actorIsSuperAdmin(pool, req.userId!))) {
+        throw new HttpError(403, "Use Admin → Sub-admins to create or promote sub-admin accounts");
+      }
       await userRepo.assignRoleByCode(pool, userId, rc);
       await auditRepo.insertAuditLog(pool, {
         actorUserId: req.userId!,
@@ -197,6 +215,7 @@ export function createPhase2AdminController(pool: Pool) {
     adminReviewKyc: async (req: AuthedRequest, res: Response) => {
       const docId = pid(req.params.docId);
       const body = adminKycReviewSchema.parse(req.body);
+      const docBefore = await kycRepo.findKycDocumentById(pool, docId);
       const ok = await kycRepo.adminReviewKyc(pool, {
         docId,
         reviewerUserId: req.userId!,
@@ -204,6 +223,9 @@ export function createPhase2AdminController(pool: Pool) {
         remarks: body.remarks ?? null,
       });
       if (!ok) throw new HttpError(404, "KYC doc not found");
+      if (body.decision === "approved" && docBefore && String(docBefore.role_code) === "ORGANIZER") {
+        emailLater(() => emailKycApprovedOrganizer(pool, BigInt(String(docBefore.user_id))));
+      }
       await auditRepo.insertAuditLog(pool, {
         actorUserId: req.userId!,
         action: "ADMIN_KYC_REVIEW",
@@ -211,26 +233,69 @@ export function createPhase2AdminController(pool: Pool) {
         entityId: String(docId),
         metadata: { decision: body.decision },
       });
+
       res.json({ ok: true });
     },
 
     // --- Sub-admin ---
+    adminListSubAdmins: async (req: AuthedRequest, res: Response) => {
+      await assertCanManageSubAdmins(pool, req.userId!);
+      const subAdmins = await subScopeRepo.listSubAdmins(pool);
+      res.json({ subAdmins });
+    },
+
     adminCreateSubAdmin: async (req: AuthedRequest, res: Response) => {
+      await assertCanManageSubAdmins(pool, req.userId!);
       const body = subAdminCreateSchema.parse(req.body);
-      const uid = BigInt(body.userId);
+      let uid: bigint;
+      let createdEmail: string | null = null;
+
+      if (body.userId) {
+        uid = BigInt(body.userId);
+        const u = await userRepo.findUserById(pool, uid);
+        if (!u) throw new HttpError(404, "User not found");
+        createdEmail = u.email;
+      } else {
+        const email = body.email!.toLowerCase().trim();
+        const existing = await userRepo.findUserByEmail(pool, email);
+        if (existing) throw new HttpError(409, "Email already registered — use userId to promote that account");
+        const passwordHash = await bcrypt.hash(body.password!, BCRYPT_ROUNDS);
+        uid = await userRepo.insertUser(pool, {
+          email,
+          passwordHash,
+          fullName: body.fullName!.trim(),
+          phone: body.phone ?? null,
+        });
+        createdEmail = email;
+      }
+
+      const targetRoles = await userRepo.getRoleCodesForUser(pool, uid);
+      if (targetRoles.includes("SUPER_ADMIN")) {
+        throw new HttpError(403, "Cannot modify a super admin account");
+      }
+
       await userRepo.assignRoleByCode(pool, uid, "SUB_ADMIN");
+      await subScopeRepo.replaceScopesForSubAdmin(pool, uid, [...SUB_ADMIN_DEFAULT_SCOPES]);
+
       await auditRepo.insertAuditLog(pool, {
         actorUserId: req.userId!,
         action: "ADMIN_CREATE_SUB_ADMIN",
         entityType: "user",
         entityId: String(uid),
-        metadata: {},
+        metadata: { email: createdEmail, defaultScopes: [...SUB_ADMIN_DEFAULT_SCOPES] },
       });
-      res.status(201).json({ ok: true });
+      res.status(201).json({
+        ok: true,
+        user: { id: String(uid), email: createdEmail, scopes: [...SUB_ADMIN_DEFAULT_SCOPES] },
+      });
     },
 
     adminPutSubAdminScopes: async (req: AuthedRequest, res: Response) => {
+      await assertCanManageSubAdmins(pool, req.userId!);
       const subAdminUserId = pid(req.params.id);
+      const targetRoles = await userRepo.getRoleCodesForUser(pool, subAdminUserId);
+      if (!targetRoles.includes("SUB_ADMIN")) throw new HttpError(400, "User is not a sub-admin");
+      if (targetRoles.includes("SUPER_ADMIN")) throw new HttpError(403, "Forbidden");
       const body = subAdminScopesPutSchema.parse(req.body);
       await subScopeRepo.replaceScopesForSubAdmin(pool, subAdminUserId, body.scopes);
       await auditRepo.insertAuditLog(pool, {

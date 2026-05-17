@@ -80,6 +80,29 @@ export async function approveUserAdminReview(pool: Pool, userId: bigint): Promis
   return r.affectedRows > 0;
 }
 
+/** Active admin inboxes for platform alerts (commission, etc.). */
+export async function listPlatformAdminEmails(pool: Pool): Promise<string[]> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT DISTINCT u.email
+     FROM users u
+     INNER JOIN user_roles ur ON ur.user_id = u.id
+     INNER JOIN roles r ON r.id = ur.role_id
+     WHERE r.code IN ('SUPER_ADMIN', 'SUB_ADMIN')
+       AND u.status = 'active'
+       AND u.email IS NOT NULL
+       AND TRIM(u.email) <> ''`
+  );
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const row of rows) {
+    const e = String(row.email).trim().toLowerCase();
+    if (!e || seen.has(e)) continue;
+    seen.add(e);
+    out.push(String(row.email).trim());
+  }
+  return out;
+}
+
 export async function getRoleCodesForUser(pool: Pool, userId: bigint): Promise<string[]> {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT r.code FROM user_roles ur
@@ -87,7 +110,15 @@ export async function getRoleCodesForUser(pool: Pool, userId: bigint): Promise<s
      WHERE ur.user_id = ?`,
     [userId]
   );
-  return rows.map((r) => String(r.code));
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const row of rows) {
+    const code = String(row.code).trim().toUpperCase();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    out.push(code);
+  }
+  return out;
 }
 
 export async function assignRoleByCode(pool: Pool, userId: bigint, roleCode: string): Promise<void> {
