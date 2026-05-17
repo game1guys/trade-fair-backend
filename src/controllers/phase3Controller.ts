@@ -1167,6 +1167,32 @@ export function createPhase3Controller(pool: Pool) {
       });
     },
 
+    subscriptionValidateReferral: async (req: AuthedRequest, res: Response) => {
+      if (!req.userId) throw new HttpError(401, "Unauthorized");
+      const body = subscriptionReferralValidateSchema.parse(req.body);
+      const planRow = await marketplaceRepo.findSubscriptionPlanById(pool, body.planId);
+      if (!planRow || !Number(planRow.active)) throw new HttpError(404, "Plan not found or inactive");
+      const targetRole = String(planRow.target_role_code ?? "ORGANIZER").toUpperCase();
+      const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
+      if (!roles.includes(targetRole)) throw new HttpError(403, `This plan is for ${targetRole} accounts only.`);
+      const priceMinor = BigInt(String(planRow.price_minor));
+      const quote = await resolveReferralForSubscription(pool, {
+        code: body.referralCode.trim(),
+        userId: req.userId!,
+        targetRoleCode: targetRole,
+        planId: body.planId,
+        priceMinor,
+      });
+      res.json({
+        label: quote.label,
+        discountLabel: quote.discountLabel,
+        originalAmountMinor: String(quote.originalAmountMinor),
+        finalAmountMinor: String(quote.finalAmountMinor),
+        discountMinor: String(quote.discountMinor),
+        code: quote.code,
+      });
+    },
+
     subscriptionCheckout: async (req: AuthedRequest, res: Response) => {
       if (!req.userId) throw new HttpError(401, "Unauthorized");
       const body = subscriptionCheckoutSchema.parse(req.body);
@@ -1176,11 +1202,31 @@ export function createPhase3Controller(pool: Pool) {
       const roles = await userRepo.getRoleCodesForUser(pool, req.userId!);
       if (!roles.includes(targetRole)) throw new HttpError(403, `This plan is for ${targetRole} accounts only.`);
       const priceMinor = BigInt(String(planRow.price_minor));
+      let chargeMinor = priceMinor;
+      let referralLabel: string | null = null;
+      let referralMeta: Record<string, string | number> = {};
+      const codeInput = body.referralCode?.trim();
+      if (codeInput) {
+        const quote = await resolveReferralForSubscription(pool, {
+          code: codeInput,
+          userId: req.userId!,
+          targetRoleCode: targetRole,
+          planId: body.planId,
+          priceMinor,
+        });
+        chargeMinor = quote.finalAmountMinor;
+        referralLabel = quote.label;
+        referralMeta = {
+          referralCodeId: quote.referralCodeId,
+          originalAmountMinor: String(quote.originalAmountMinor),
+          discountMinor: String(quote.discountMinor),
+        };
+      }
       const days = Number(planRow.duration_days);
       const starts = new Date();
       const ends = new Date(starts.getTime() + days * 86400000);
 
-      if (priceMinor === 0n) {
+      if (chargeMinor === 0n) {
         await marketplaceRepo.expireActiveSubscriptionsForUserAndRole(pool, req.userId!, targetRole);
         const subId = await marketplaceRepo.insertSubscription(pool, {
           userId: req.userId!,
@@ -1200,7 +1246,7 @@ export function createPhase3Controller(pool: Pool) {
 
       const paymentId = await paymentRepo.insertPayment(pool, {
         payerUserId: req.userId!,
-        amountMinor: priceMinor,
+        amountMinor: chargeMinor,
         currency: "INR",
         status: "created",
         razorpayOrderId: null,
@@ -1208,16 +1254,19 @@ export function createPhase3Controller(pool: Pool) {
         bookingId: null,
         ticketOrderId: null,
         serviceBookingId: null,
-        metadata: { kind: "subscription_plan", planId: body.planId },
+        metadata: { kind: "subscription_plan", planId: body.planId, ...referralMeta },
       });
-      const rz = await razorpay.createOrder(Number(priceMinor), "INR", `subp_${paymentId}`);
+      const rz = await razorpay.createOrder(Number(chargeMinor), "INR", `subp_${paymentId}`);
       await paymentRepo.updatePaymentRazorpayOrderId(pool, paymentId, rz.orderId);
       res.status(201).json({
         paymentId: String(paymentId),
         razorpayOrderId: rz.orderId,
         razorpayKeyId: process.env.RAZORPAY_KEY_ID ?? "",
         planId: body.planId,
-        amountMinor: String(priceMinor),
+        amountMinor: String(chargeMinor),
+        originalAmountMinor: referralMeta.originalAmountMinor ?? String(priceMinor),
+        discountMinor: referralMeta.discountMinor ?? "0",
+        referralLabel,
       });
     },
 

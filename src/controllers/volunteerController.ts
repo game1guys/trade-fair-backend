@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import type { RowDataPacket } from "mysql2";
 import type { Pool } from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import * as eventRepo from "../repositories/eventRepository.js";
@@ -19,9 +20,10 @@ import {
 
 const SALT_ROUNDS = 12;
 
-function pid(raw: string): bigint {
-  if (!/^\d+$/.test(raw)) throw new HttpError(400, "Invalid id");
-  return BigInt(raw);
+function pid(raw: string | string[] | undefined): bigint {
+  const s = Array.isArray(raw) ? raw[0] : raw;
+  if (!s || !/^\d+$/.test(s)) throw new HttpError(400, "Invalid id");
+  return BigInt(s);
 }
 
 function uploadPublicUrl(relativePath: string): string {
@@ -29,16 +31,7 @@ function uploadPublicUrl(relativePath: string): string {
   return `${prefix}/static/uploads/${relativePath}`;
 }
 
-function serializeVolunteerRow(r: {
-  id: unknown;
-  full_name: unknown;
-  phone: unknown;
-  photo_url: unknown;
-  user_id: unknown;
-  login_email: unknown;
-  created_at?: unknown;
-  assignment_count?: unknown;
-}) {
+function serializeVolunteerRow(r: RowDataPacket) {
   return {
     id: String(r.id),
     fullName: String(r.full_name),
@@ -105,7 +98,7 @@ export function createVolunteerController(pool: Pool) {
             photo_url: photoUrl,
             user_id: userId,
             login_email: body.email.toLowerCase(),
-          }),
+          } as RowDataPacket),
           loginEmail: body.email.toLowerCase(),
         },
       });

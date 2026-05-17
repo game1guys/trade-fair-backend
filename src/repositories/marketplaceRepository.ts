@@ -865,7 +865,7 @@ export function parseMachineryJson(raw: unknown): MachineryItem[] {
         details: o.details != null ? String(o.details) : null,
       };
     })
-    .filter((x): x is MachineryItem => x != null);
+    .filter((x) => x != null) as MachineryItem[];
 }
 
 export async function findContractByRequestId(pool: Pool, requestId: bigint) {
